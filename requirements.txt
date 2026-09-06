@@ -1,0 +1,15 @@
+# Runtime for Streamlit UI + FastAPI / DuckDB data layer.
+altair
+duckdb
+fastapi
+httpx
+matplotlib
+pandas
+polars
+pyarrow
+requests
+seaborn
+streamlit
+streamlit-aggrid==1.1.8.post1
+streamlit-extras
+uvicorn
