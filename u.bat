@@ -1,8 +1,8 @@
 @echo off
 rem Sync BridgeStats parquet from the pipeline (no pkl files).
-rem Large board-results monoliths stay on E: and are found at runtime via
-rem resolve_data_file. Only the small lookup/narrow files are copied into
-rem data\ and published to prod.
+rem Club board-results is still small (builder output / demo) so it is copied
+rem into data\ and published with the lookup/narrow files. If it later becomes
+rem an E: monolith, drop it from this list and mount extra-data instead.
 
 set "ffbridge_source=e:\bridge\data\ffbridge"
 set "ffbridge_source_data=e:\bridge\data\ffbridge\data"
@@ -18,6 +18,7 @@ if not exist "data\" (
 for %%S in ("%ffbridge_source%" "%ffbridge_source_data%") do (
     if exist "%%~S\" (
         for %%F in (
+            ffbridge_club_board_results_augmented.parquet
             ffbridge_club_hand_records_augmented_narrow.parquet
             ffbridge_player_info.parquet
             ffbridge_clubs.parquet
@@ -44,6 +45,7 @@ if not exist "%prod_bridgestats%\" (
 )
 
 for %%F in (
+    ffbridge_club_board_results_augmented.parquet
     ffbridge_club_hand_records_augmented_narrow.parquet
     ffbridge_player_info.parquet
     ffbridge_clubs.parquet
