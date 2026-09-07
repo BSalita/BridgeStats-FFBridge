@@ -1,12 +1,15 @@
 # Runtime for Streamlit UI + FastAPI / DuckDB data layer.
 altair
+beautifulsoup4
 duckdb
 fastapi
 httpx
+markdown
 matplotlib
 pandas
 polars
 pyarrow
+reportlab
 requests
 seaborn
 streamlit
