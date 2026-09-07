@@ -45,6 +45,19 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(out["OnLead"][0], "2")
         self.assertEqual(out["NotOnLead"][0], "4")
 
+    def test_from_quality_cache_skips_training_parquet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "ffbridge_training_data_df.parquet").write_bytes(b"not-a-parquet")
+            with self.assertRaises(FileNotFoundError):
+                builder.build(
+                    output_dir=root / "out",
+                    source_dir=source,
+                    from_quality_cache=True,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ through the quality pipeline / mlBridge) then writes ACBL-shaped Club files.
 Usage:
     python build_ffbridge_club_parquets.py --demo
     python build_ffbridge_club_parquets.py --source-dir E:\\bridge\\data\\ffbridge\\data
+    python build_ffbridge_club_parquets.py --from-quality-cache --source-dir E:\\bridge\\data\\ffbridge\\data
     python build_ffbridge_club_parquets.py --training-parquet path\\to\\ffbridge_training_data_df.parquet
 """
 
@@ -518,13 +519,18 @@ def build(
     training_parquet: Optional[pathlib.Path] = None,
     demo: bool = False,
     session_limit: Optional[int] = None,
+    from_quality_cache: bool = False,
 ) -> Dict[str, str]:
     if demo:
         boards, hands, players, clubs = demo_frames()
         return write_outputs(output_dir, boards, hands, players, clubs)
 
     frame: Optional[pl.DataFrame] = None
-    if training_parquet and training_parquet.is_file():
+    if from_quality_cache:
+        if not source_dir:
+            raise ValueError("--from-quality-cache requires --source-dir")
+        frame = _try_build_from_quality_cache(source_dir, session_limit)
+    elif training_parquet and training_parquet.is_file():
         frame = _load_training_or_augmented(training_parquet)
     elif source_dir:
         training = source_dir / "ffbridge_training_data_df.parquet"
@@ -563,6 +569,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--demo", action="store_true", help="Write a tiny fixture dataset.")
     parser.add_argument(
+        "--from-quality-cache",
+        action="store_true",
+        help="Ignore the training parquet and augment complete cached sessions.",
+    )
+    parser.add_argument(
         "--session-limit",
         type=int,
         default=None,
@@ -580,6 +591,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         training_parquet=args.training_parquet,
         demo=args.demo,
         session_limit=args.session_limit,
+        from_quality_cache=args.from_quality_cache,
     )
     print(json.dumps({"output_dir": str(output_dir), "files": written}, indent=2))
     return 0

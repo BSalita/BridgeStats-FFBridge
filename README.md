@@ -24,7 +24,10 @@ Runtime reads local Club parquets only. Lancelot is used only by
 ```bash
 python build_ffbridge_club_parquets.py --demo
 python build_ffbridge_club_parquets.py --source-dir E:\bridge\data\ffbridge\data
+python build_ffbridge_club_parquets.py --from-quality-cache --source-dir E:\bridge\data\ffbridge\data
 ```
+
+Full refresh + publish is `..\ffbridge-pipeline\ffbridge_all.bat` (the `acbl_all.bat` counterpart).
 
 Expected files:
 
