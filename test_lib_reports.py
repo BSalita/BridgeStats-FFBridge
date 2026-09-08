@@ -108,6 +108,50 @@ class ReportLibTests(unittest.TestCase):
         self.assertEqual(exact["player_id"].to_list(), ["246273"])
         partial = lib.filter_players_by_number(df, "246", "player_id")
         self.assertEqual(partial.height, 0)
+
+    def test_player_number_accepts_license_and_lancelot_aliases(self) -> None:
+        import os
+        import tempfile
+        from pathlib import Path
+
+        catalog = pl.DataFrame(
+            {
+                "player_id": ["597539", "111111"],
+                "first_name": ["Robert", "Jean"],
+                "last_name": ["Salita", "Balleroy"],
+            }
+        )
+        persons = pl.DataFrame(
+            {
+                "lancelot_person_id": ["246273"],
+                "classic_person_id": ["597539"],
+                "license_number": ["9500754"],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            persons.write_parquet(Path(tmp) / "lancelot_persons.parquet")
+            previous = os.environ.get(lib.PERSON_INDEX_DIR_ENV)
+            os.environ[lib.PERSON_INDEX_DIR_ENV] = tmp
+            lib.reset_person_alias_cache()
+            try:
+                by_license = lib.filter_players_by_number(
+                    catalog, "9500754", "player_id"
+                )
+                by_lancelot = lib.filter_players_by_number(
+                    catalog, "246273", "player_id"
+                )
+                by_classic = lib.filter_players_by_number(
+                    catalog, "597539", "player_id"
+                )
+            finally:
+                lib.reset_person_alias_cache()
+                if previous is None:
+                    os.environ.pop(lib.PERSON_INDEX_DIR_ENV, None)
+                else:
+                    os.environ[lib.PERSON_INDEX_DIR_ENV] = previous
+        self.assertEqual(by_license["player_id"].to_list(), ["597539"])
+        self.assertEqual(by_lancelot["player_id"].to_list(), ["597539"])
+        self.assertEqual(by_classic["player_id"].to_list(), ["597539"])
         ranked = lib.filter_players_by_name(
             pl.DataFrame(
                 {

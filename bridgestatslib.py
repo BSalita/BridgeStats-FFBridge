@@ -20,7 +20,16 @@ import polars as pl
 
 DATA_DIR_ENV = "BRIDGESTATS_FFBRIDGE_DATA_DIR"
 EXTRA_DATA_DIR_ENV = "BRIDGESTATS_EXTRA_DATA_DIR"
+PERSON_INDEX_DIR_ENV = "FFBRIDGE_PLAYER_SESSION_INDEX_DIR"
+PERSONS_FILENAME = "lancelot_persons.parquet"
 _DATA_DIR_ALIASES = (DATA_DIR_ENV, "BRIDGESTATS_DATA_DIR")
+_PERSON_ALIAS_COLUMNS = (
+    "lancelot_person_id",
+    "classic_person_id",
+    "license_number",
+)
+_PERSONS_CACHE: Optional[pl.DataFrame] = None
+_PERSONS_LOADED = False
 
 DEFAULT_SQL_ROW_LIMIT = 500
 MAX_SQL_ROW_LIMIT = 2000
@@ -208,6 +217,99 @@ def data_search_roots() -> List[pathlib.Path]:
     return unique
 
 
+def reset_person_alias_cache() -> None:
+    global _PERSONS_CACHE, _PERSONS_LOADED
+    _PERSONS_CACHE = None
+    _PERSONS_LOADED = False
+
+
+def person_alias_search_roots() -> List[pathlib.Path]:
+    roots: List[pathlib.Path] = []
+    env = os.environ.get(PERSON_INDEX_DIR_ENV, "").strip()
+    if env:
+        roots.append(pathlib.Path(env))
+    roots.extend(data_search_roots())
+    roots.append(
+        pathlib.Path(__file__).resolve().parent.parent
+        / "elo"
+        / "data"
+        / "ffbridge"
+        / "player_session_index"
+    )
+    seen: set[str] = set()
+    unique: List[pathlib.Path] = []
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def load_person_aliases_df() -> Optional[pl.DataFrame]:
+    global _PERSONS_CACHE, _PERSONS_LOADED
+    if _PERSONS_LOADED:
+        return _PERSONS_CACHE
+    _PERSONS_LOADED = True
+    for root in person_alias_search_roots():
+        for path in (
+            root / PERSONS_FILENAME,
+            root / "player_session_index" / PERSONS_FILENAME,
+        ):
+            if not path.is_file():
+                continue
+            try:
+                _PERSONS_CACHE = pl.read_parquet(
+                    path, columns=list(_PERSON_ALIAS_COLUMNS)
+                )
+                return _PERSONS_CACHE
+            except Exception:
+                continue
+    _PERSONS_CACHE = None
+    return None
+
+
+def expand_ffbridge_player_numbers(tokens: Sequence[str]) -> List[str]:
+    """Map license, Lancelot, or Classic ids to every known alias."""
+    cleaned = [str(token).strip() for token in tokens if str(token).strip()]
+    if not cleaned:
+        return []
+    persons = load_person_aliases_df()
+    if persons is None or persons.is_empty():
+        return list(dict.fromkeys(cleaned))
+    expanded: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            expanded.append(text)
+
+    id_col = (
+        "lancelot_person_id"
+        if "lancelot_person_id" in persons.columns
+        else persons.columns[0]
+    )
+    for token in cleaned:
+        add(token)
+        predicate = None
+        for column in _PERSON_ALIAS_COLUMNS:
+            if column not in persons.columns:
+                continue
+            part = pl.col(column).cast(pl.Utf8) == token
+            predicate = part if predicate is None else predicate | part
+        if predicate is None:
+            continue
+        matches = persons.filter(predicate).unique(subset=[id_col])
+        if matches.height != 1:
+            continue
+        row = matches.row(0, named=True)
+        for column in _PERSON_ALIAS_COLUMNS:
+            add(row.get(column))
+    return expanded
+
+
 def source_probe_columns(required, optional=()) -> Tuple[str, ...]:
     """Columns used to reject stale parquets. Skip source-optional names (Club)."""
     return tuple(col for col in required if col not in optional)[:2]
@@ -342,7 +444,7 @@ def apply_filters(board_results_df, clubs, players, pairs, start_date, end_date)
         df = df.filter(pl.col("Club").cast(pl.Utf8).is_in(club_list))
 
     if players:
-        player_list = [str(p) for p in players]
+        player_list = expand_ffbridge_player_numbers([str(p) for p in players])
         player_columns = []
         for col_name in ("Player_ID_N", "Player_ID_E", "Player_ID_S", "Player_ID_W"):
             if col_name in columns:
@@ -1213,6 +1315,7 @@ def filter_players_by_number(
     tokens = [token for token in (numbers or "").replace(",", " ").split() if token]
     if not tokens or df.is_empty() or id_col not in df.columns:
         return df
+    tokens = expand_ffbridge_player_numbers(tokens)
     return df.filter(pl.col(id_col).cast(pl.Utf8).is_in(tokens))
 
 
@@ -1269,7 +1372,12 @@ def unknown_players(players: Sequence[str]) -> List[str]:
     if not players:
         return []
     names = load_player_name_dict()
-    return [player for player in players if player not in names]
+    unknown: List[str] = []
+    for player in players:
+        aliases = expand_ffbridge_player_numbers([str(player)])
+        if not any(alias in names for alias in aliases):
+            unknown.append(str(player))
+    return unknown
 
 
 def _prepare_board_frames(

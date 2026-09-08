@@ -11,8 +11,8 @@ import bridgestats_api_client as api
 
 PLAYER_NUMBER_PATTERN = r"^\d{3,12}$"
 PLAYER_NUMBER_HELP = (
-    "Digits-only exact match. Enter one or more FFBridge / Lancelot player IDs. "
-    "For pairs, matches either partner."
+    "Digits-only exact match. Enter one or more license, Lancelot, or "
+    "Classic/migration IDs. For pairs, matches either partner."
 )
 PLAYER_NAME_HELP = (
     "Case-insensitive fuzzy match on first and last name. "
@@ -75,12 +75,27 @@ def resolve_player_ids(
     key_prefix: str = "",
     max_options: int = MAX_NAME_SELECT_OPTIONS,
 ) -> List[str]:
-    resolved = list(numbers)
+    resolved: List[str] = []
+    seen: set[str] = set()
+    clubs_arg = " ".join(str(club) for club in clubs) if clubs else None
+    for number in numbers:
+        try:
+            payload = api.player_lookup(
+                clubs=clubs_arg,
+                numbers=number,
+                limit=1,
+            )
+        except api.BridgeStatsApiClientError as exc:
+            st.error(str(exc))
+            st.stop()
+        rows = [row for row in (payload.get("rows") or []) if _row_player_id(row)]
+        pid = _row_player_id(rows[0]) if rows else str(number)
+        if pid and pid not in seen:
+            seen.add(pid)
+            resolved.append(pid)
     queries = [part.strip() for part in re.split(r"[,;]", name_filter or "") if part.strip()]
     if not queries:
         return resolved
-    clubs_arg = " ".join(str(club) for club in clubs) if clubs else None
-    seen = set(resolved)
     for index, query in enumerate(queries):
         letters = re.sub(r"[^a-z0-9]+", "", query, flags=re.I)
         if len(letters) < 3:
