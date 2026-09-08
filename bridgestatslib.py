@@ -1116,7 +1116,7 @@ def player_lookup(
     if numbers_regex:
         df = df.filter(pl.col(id_col).str.contains(numbers_regex))
     if names_regex and "last_name" in df.columns:
-        df = df.filter(pl.col("last_name").str.contains(names_regex, ignore_case=True))
+        df = df.filter(pl.col("last_name").str.contains("(?i)" + names_regex))
     drop_mp = [col for col in df.columns if col.startswith("mp_")]
     if drop_mp:
         df = df.drop(drop_mp)
@@ -1139,7 +1139,7 @@ def club_lookup(
     if clubs_regex:
         df = df.filter(pl.col("id").str.contains(clubs_regex))
     if names_regex and "name" in df.columns:
-        df = df.filter(pl.col("name").str.contains(names_regex, ignore_case=True))
+        df = df.filter(pl.col("name").str.contains("(?i)" + names_regex))
     limit = max(1, min(limit, MAX_LOOKUP_ROWS))
     return {"total": df.height, **frame_to_table(df, limit=limit)}
 

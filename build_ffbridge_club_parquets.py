@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import gc
 import json
 import pathlib
 import sys
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import polars as pl
 
@@ -37,6 +38,7 @@ BOARD_FILENAME = "ffbridge_club_board_results_augmented.parquet"
 HAND_FILENAME = "ffbridge_club_hand_records_augmented_narrow.parquet"
 PLAYER_FILENAME = "ffbridge_player_info.parquet"
 CLUB_FILENAME = "ffbridge_clubs.parquet"
+CLUB_FRAGMENT_DIRNAME = "club_session_fragments"
 
 
 def _first_present(frame: pl.DataFrame, names: Sequence[str]) -> Optional[str]:
@@ -48,6 +50,176 @@ def _first_present(frame: pl.DataFrame, names: Sequence[str]) -> Optional[str]:
 
 def _as_string(frame: pl.DataFrame, name: str) -> pl.Expr:
     return pl.col(name).cast(pl.Utf8)
+
+
+def _as_date_expr(frame: pl.DataFrame, name: str) -> pl.Expr:
+    dtype = frame.schema[name]
+    if dtype == pl.Date:
+        return pl.col(name)
+    if dtype == pl.Datetime or getattr(dtype, "base_type", lambda: None)() == pl.Datetime:
+        return pl.col(name).cast(pl.Date)
+    return pl.col(name).cast(pl.Utf8).str.to_datetime(strict=False).cast(pl.Date)
+
+
+def _parse_session_date(payload: Mapping[str, Any]) -> Optional[datetime.date]:
+    candidates: List[Any] = [payload.get("date"), payload.get("startDate")]
+    candidates.extend(
+        group_session.get("date")
+        for group_session in payload.get("groupSessions") or []
+        if isinstance(group_session, Mapping)
+    )
+    for candidate in candidates:
+        if candidate in (None, ""):
+            continue
+        try:
+            return datetime.datetime.fromisoformat(
+                str(candidate).replace("Z", "+00:00")
+            ).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_session_club(payload: Mapping[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    found: Dict[str, str] = {}
+    for group_session in payload.get("groupSessions") or []:
+        if not isinstance(group_session, Mapping):
+            continue
+        org = (
+            ((group_session.get("group") or {}).get("phase") or {}).get("stade") or {}
+        ).get("organization") or {}
+        if not isinstance(org, Mapping):
+            continue
+        code = org.get("ffbCode")
+        if not code:
+            continue
+        found[str(code)] = str(org.get("label") or org.get("name") or "")
+    if len(found) != 1:
+        return None, None
+    code, name = next(iter(found.items()))
+    return code, name
+
+
+def load_session_lookup(source_dir: pathlib.Path) -> pl.DataFrame:
+    """session_id -> Date / Club / club_name from Lancelot session metadata."""
+    sessions_dir = pathlib.Path(source_dir) / "competitions" / "sessions"
+    rows: List[Dict[str, Any]] = []
+    if sessions_dir.is_dir():
+        for path in sessions_dir.glob("*.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            session_id = str(payload.get("id") or path.stem)
+            club, name = _parse_session_club(payload)
+            rows.append(
+                {
+                    "session_id": session_id,
+                    "Date": _parse_session_date(payload),
+                    "Club": club,
+                    "club_name": name,
+                }
+            )
+    if not rows:
+        return pl.DataFrame(
+            {
+                "session_id": [],
+                "Date": [],
+                "Club": [],
+                "club_name": [],
+            }
+        ).with_columns(
+            pl.col("Date").cast(pl.Date),
+            pl.col("Club").cast(pl.Utf8),
+            pl.col("club_name").cast(pl.Utf8),
+        )
+    return pl.DataFrame(rows).with_columns(
+        pl.col("session_id").cast(pl.Utf8),
+        pl.col("Date").cast(pl.Date),
+        pl.col("Club").cast(pl.Utf8),
+        pl.col("club_name").cast(pl.Utf8),
+    )
+
+
+def _attach_board_lookup(boards: pl.DataFrame, lookup: pl.DataFrame) -> pl.DataFrame:
+    meta = lookup.select("session_id", "Date", "Club")
+    out = boards.with_columns(pl.col("session_id").cast(pl.Utf8))
+    drop = [name for name in ("Date", "Club") if name in out.columns]
+    if drop:
+        out = out.drop(drop)
+    out = out.join(meta, on="session_id", how="left")
+    return out.select(list(BOARD_RESULT_COLUMNS))
+
+
+def _attach_hand_lookup(hands: pl.DataFrame, lookup: pl.DataFrame) -> pl.DataFrame:
+    meta = lookup.select(
+        pl.col("session_id"),
+        pl.col("Date").alias("game_date"),
+    )
+    out = hands.with_columns(pl.col("session_id").cast(pl.Utf8))
+    if "game_date" in out.columns:
+        out = out.drop("game_date")
+    out = out.join(meta, on="session_id", how="left")
+    return out.select(list(HAND_RECORD_COLUMNS))
+
+
+def _clubs_from_lookup(lookup: pl.DataFrame) -> pl.DataFrame:
+    return (
+        lookup.select(
+            pl.col("Club").alias("id"),
+            pl.col("club_name").alias("name"),
+        )
+        .filter(pl.col("id").is_not_null() & (pl.col("id") != ""))
+        .unique(subset=["id"], maintain_order=True)
+    )
+
+
+def _fill_player_clubs(players: pl.DataFrame, boards: pl.DataFrame) -> pl.DataFrame:
+    if players.height == 0 or "Club" not in boards.columns:
+        return players
+    seats = []
+    for seat in SEATS:
+        col = f"Player_ID_{seat}"
+        if col in boards.columns:
+            seats.append(
+                boards.select(
+                    pl.col(col).cast(pl.Utf8).alias("player_id"),
+                    pl.col("Club").cast(pl.Utf8).alias("club"),
+                )
+            )
+    if not seats:
+        return players
+    mode = (
+        pl.concat(seats, how="vertical")
+        .filter(
+            pl.col("player_id").is_not_null()
+            & (pl.col("player_id") != "")
+            & pl.col("club").is_not_null()
+            & (pl.col("club") != "")
+        )
+        .group_by("player_id")
+        .agg(pl.col("club").mode().first().alias("club"))
+    )
+    out = players.with_columns(pl.col("player_id").cast(pl.Utf8))
+    if "club" in out.columns:
+        out = out.drop("club")
+    return out.join(mode, on="player_id", how="left").with_columns(
+        pl.col("club").cast(pl.Utf8).fill_null("")
+    )
+
+
+def apply_session_lookup(
+    boards: pl.DataFrame,
+    hands: pl.DataFrame,
+    players: pl.DataFrame,
+    lookup: pl.DataFrame,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    boards = _attach_board_lookup(boards, lookup)
+    hands = _attach_hand_lookup(hands, lookup)
+    players = _fill_player_clubs(players, boards)
+    clubs = _clubs_from_lookup(lookup)
+    if clubs.height == 0:
+        clubs = map_clubs(boards)
+    return boards, hands, players, clubs
 
 
 def _seat_player_expr(direction_col: str, prefix: str) -> pl.Expr:
@@ -75,13 +247,7 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
 
     date_col = _first_present(out, ("Date", "game_date", "session_date"))
     if date_col:
-        if out.schema[date_col] == pl.Date:
-            if date_col != "Date":
-                out = out.with_columns(pl.col(date_col).alias("Date"))
-        else:
-            out = out.with_columns(
-                pl.col(date_col).cast(pl.Utf8).str.to_date(strict=False).alias("Date")
-            )
+        out = out.with_columns(_as_date_expr(out, date_col).alias("Date"))
     else:
         out = out.with_columns(pl.lit(None, dtype=pl.Date).alias("Date"))
 
@@ -222,6 +388,13 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
     }
     for dest, default in string_defaults.items():
         if dest in out.columns:
+            if dest == "Vul_Declarer" and out.schema[dest] == pl.Boolean:
+                out = out.with_columns(
+                    pl.when(pl.col(dest))
+                    .then(pl.lit("Y"))
+                    .otherwise(pl.lit("N"))
+                    .alias(dest)
+                )
             continue
         src = _first_present(out, string_aliases.get(dest, (dest,)))
         if src:
@@ -471,8 +644,100 @@ def _load_training_or_augmented(path: pathlib.Path) -> pl.DataFrame:
     return pl.read_parquet(path)
 
 
-def _try_build_from_quality_cache(source_dir: pathlib.Path, limit: Optional[int]) -> Optional[pl.DataFrame]:
-    """Reuse the Elo quality pipeline's raw+augment path when available."""
+def _fragment_paths(
+    output_dir: pathlib.Path, session_id: str
+) -> tuple[pathlib.Path, pathlib.Path]:
+    root = pathlib.Path(output_dir) / CLUB_FRAGMENT_DIRNAME / session_id
+    return root / "boards.parquet", root / "hands.parquet"
+
+
+def _atomic_write_parquet(frame: pl.DataFrame, path: pathlib.Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    frame.write_parquet(tmp)
+    tmp.replace(path)
+
+
+def write_session_fragments(
+    output_dir: pathlib.Path,
+    session_id: str,
+    boards: pl.DataFrame,
+    hands: pl.DataFrame,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    board_path, hand_path = _fragment_paths(output_dir, session_id)
+    _atomic_write_parquet(boards, board_path)
+    _atomic_write_parquet(hands, hand_path)
+    return board_path, hand_path
+
+
+def _extend_unique(
+    acc: List[pl.DataFrame],
+    frame: pl.DataFrame,
+    subset: str,
+    *,
+    flush_at: int = 32,
+) -> List[pl.DataFrame]:
+    if frame.height == 0:
+        return acc
+    acc.append(frame)
+    if len(acc) < flush_at:
+        return acc
+    return [
+        pl.concat(acc, how="vertical_relaxed").unique(
+            subset=[subset], maintain_order=True
+        )
+    ]
+
+
+def _finalize_unique(
+    acc: List[pl.DataFrame],
+    subset: str,
+    empty: pl.DataFrame,
+) -> pl.DataFrame:
+    if not acc:
+        return empty
+    return pl.concat(acc, how="vertical_relaxed").unique(
+        subset=[subset], maintain_order=True
+    )
+
+
+def _concat_parquet_paths(paths: Sequence[pathlib.Path]) -> Optional[pl.DataFrame]:
+    existing = [path for path in paths if path.is_file()]
+    if not existing:
+        return None
+    if len(existing) == 1:
+        return pl.read_parquet(existing[0])
+    return pl.scan_parquet(existing).collect()
+
+
+def read_club_fragments(
+    output_dir: pathlib.Path, session_ids: Iterable[str]
+) -> tuple[Optional[pl.DataFrame], Optional[pl.DataFrame]]:
+    board_paths = []
+    hand_paths = []
+    for session_id in session_ids:
+        board_path, hand_path = _fragment_paths(output_dir, session_id)
+        if board_path.is_file():
+            board_paths.append(board_path)
+        if hand_path.is_file():
+            hand_paths.append(hand_path)
+    boards = _concat_parquet_paths(board_paths)
+    hands = _concat_parquet_paths(hand_paths)
+    if hands is not None and "PBN" in hands.columns:
+        hands = hands.unique(subset=["PBN"], maintain_order=True)
+    return boards, hands
+
+
+def _try_write_from_quality_cache(
+    source_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    limit: Optional[int],
+) -> Optional[Dict[str, str]]:
+    """Augment one session at a time and persist slim Club fragments.
+
+    Holding every mlBridge frame until a final concat OOMs on the full
+    historical cache. Fragments also let a rerun resume after a crash.
+    """
     elo_dir = pathlib.Path(__file__).resolve().parent.parent / "elo"
     if str(elo_dir) not in sys.path:
         sys.path.insert(0, str(elo_dir))
@@ -490,26 +755,91 @@ def _try_build_from_quality_cache(source_dir: pathlib.Path, limit: Optional[int]
     except Exception as exc:
         print(f"[ffbridge-stats-builder] cache audit failed: {exc}", flush=True)
         return None
-    frames: List[pl.DataFrame] = []
     complete = [session for session in audit.sessions if session.complete]
     if limit:
         complete = complete[:limit]
     print(f"[ffbridge-stats-builder] augmenting {len(complete)} cached sessions", flush=True)
-    for session in complete:
+    lookup = load_session_lookup(source_dir)
+    kept_ids: List[str] = []
+    player_acc: List[pl.DataFrame] = []
+    club_acc: List[pl.DataFrame] = []
+    empty_players = pl.DataFrame(
+        {"player_id": [], "first_name": [], "last_name": [], "club": []}
+    )
+    empty_clubs = pl.DataFrame({"id": [], "name": []})
+    for index, session in enumerate(complete, start=1):
+        board_path, hand_path = _fragment_paths(output_dir, session.session_id)
         try:
-            raw, _unmapped = load_raw_session(source_dir, session)
-            if "Date" not in raw.columns and session.session_date:
-                raw = raw.with_columns(pl.lit(session.session_date).alias("Date"))
-            augmented = augment_raw_session(raw)
-            frames.append(augmented)
+            if board_path.is_file() and hand_path.is_file():
+                boards = pl.read_parquet(board_path)
+                status = "resume"
+            else:
+                raw, _unmapped = load_raw_session(source_dir, session)
+                if "Date" not in raw.columns and session.session_date:
+                    raw = raw.with_columns(pl.lit(session.session_date).alias("Date"))
+                augmented = augment_raw_session(raw)
+                del raw
+                meta = lookup.filter(
+                    pl.col("session_id") == str(session.session_id)
+                )
+                if meta.height:
+                    rec = meta.row(0, named=True)
+                    overlays = []
+                    if rec.get("Date") is not None:
+                        overlays.append(pl.lit(rec["Date"]).alias("Date"))
+                    if rec.get("Club"):
+                        overlays.append(pl.lit(rec["Club"]).alias("Club"))
+                        overlays.append(
+                            pl.lit(rec.get("club_name") or "").alias("club_name")
+                        )
+                    if overlays:
+                        augmented = augmented.with_columns(*overlays)
+                boards, hands, _players, _clubs = build_from_frame(augmented)
+                del augmented
+                write_session_fragments(output_dir, session.session_id, boards, hands)
+                status = "augment"
+            kept_ids.append(session.session_id)
+            player_acc = _extend_unique(player_acc, map_players(boards), "player_id")
+            club_acc = _extend_unique(club_acc, map_clubs(boards), "id")
+            print(
+                f"[ffbridge-stats-builder] {index}/{len(complete)} "
+                f"session {session.session_id} {status}",
+                flush=True,
+            )
         except Exception as exc:
             print(
                 f"[ffbridge-stats-builder] skip session {session.session_id}: {exc}",
                 flush=True,
             )
-    if not frames:
+        if index % 50 == 0:
+            gc.collect()
+    boards, hands = read_club_fragments(output_dir, kept_ids)
+    if boards is None or boards.height == 0:
         return None
-    return pl.concat(frames, how="diagonal_relaxed")
+    if hands is None:
+        hands = map_hand_records(boards)
+    players = _finalize_unique(player_acc, "player_id", empty_players)
+    if players.height == 0:
+        players = map_players(boards)
+    boards, hands, players, clubs = apply_session_lookup(
+        boards, hands, players, lookup
+    )
+    return write_outputs(output_dir, boards, hands, players, clubs)
+
+
+def repair_outputs_from_metadata(
+    output_dir: pathlib.Path,
+    source_dir: pathlib.Path,
+) -> Dict[str, str]:
+    """Fill Date/Club on already-built Club parquets from session metadata."""
+    boards = pl.read_parquet(output_dir / BOARD_FILENAME)
+    hands = pl.read_parquet(output_dir / HAND_FILENAME)
+    players = pl.read_parquet(output_dir / PLAYER_FILENAME)
+    lookup = load_session_lookup(source_dir)
+    boards, hands, players, clubs = apply_session_lookup(
+        boards, hands, players, lookup
+    )
+    return write_outputs(output_dir, boards, hands, players, clubs)
 
 
 def build(
@@ -525,19 +855,30 @@ def build(
         boards, hands, players, clubs = demo_frames()
         return write_outputs(output_dir, boards, hands, players, clubs)
 
-    frame: Optional[pl.DataFrame] = None
     if from_quality_cache:
         if not source_dir:
             raise ValueError("--from-quality-cache requires --source-dir")
-        frame = _try_build_from_quality_cache(source_dir, session_limit)
-    elif training_parquet and training_parquet.is_file():
+        written = _try_write_from_quality_cache(source_dir, output_dir, session_limit)
+        if written:
+            return written
+        raise FileNotFoundError(
+            "No FFBridge Club source found. Pass --training-parquet, "
+            "--source-dir with cache/training data, or --demo."
+        )
+
+    frame: Optional[pl.DataFrame] = None
+    if training_parquet and training_parquet.is_file():
         frame = _load_training_or_augmented(training_parquet)
     elif source_dir:
         training = source_dir / "ffbridge_training_data_df.parquet"
         if training.is_file():
             frame = _load_training_or_augmented(training)
         else:
-            frame = _try_build_from_quality_cache(source_dir, session_limit)
+            written = _try_write_from_quality_cache(
+                source_dir, output_dir, session_limit
+            )
+            if written:
+                return written
     if frame is None or frame.height == 0:
         raise FileNotFoundError(
             "No FFBridge Club source found. Pass --training-parquet, "
@@ -579,12 +920,23 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="When augmenting from cache, process at most this many sessions.",
     )
+    parser.add_argument(
+        "--repair-from-metadata",
+        action="store_true",
+        help="Fill Date/Club on existing Club parquets from session metadata.",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     output_dir = args.output_dir or resolve_data_path()
+    if args.repair_from_metadata:
+        if not args.source_dir:
+            raise ValueError("--repair-from-metadata requires --source-dir")
+        written = repair_outputs_from_metadata(output_dir, args.source_dir)
+        print(json.dumps({"output_dir": str(output_dir), "files": written}, indent=2))
+        return 0
     written = build(
         output_dir=output_dir,
         source_dir=args.source_dir,
