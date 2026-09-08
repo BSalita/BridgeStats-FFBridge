@@ -174,6 +174,29 @@ class BridgeStatsApiTests(unittest.TestCase):
         self.assertGreaterEqual(body["selected_count"], 1)
         self.assertTrue(body["player_boards"])
 
+    def test_player_lookup_fuzzy_name_and_exact_number(self) -> None:
+        by_name = self.client.get(
+            "/ffbridge-stats/players/lookup",
+            params={"names": "salitta", "limit": 10},
+        )
+        self.assertEqual(by_name.status_code, 200, by_name.text)
+        ids = [row["player_id"] for row in by_name.json()["rows"]]
+        self.assertEqual(ids, ["246273"])
+        by_number = self.client.get(
+            "/ffbridge-stats/players/lookup",
+            params={"numbers": "246273", "limit": 10},
+        )
+        self.assertEqual(by_number.status_code, 200, by_number.text)
+        self.assertEqual(
+            [row["player_id"] for row in by_number.json()["rows"]], ["246273"]
+        )
+        partial = self.client.get(
+            "/ffbridge-stats/players/lookup",
+            params={"numbers": "246", "limit": 10},
+        )
+        self.assertEqual(partial.status_code, 200, partial.text)
+        self.assertEqual(partial.json()["total"], 0)
+
     def test_hand_records(self) -> None:
         report = self.client.post(
             "/ffbridge-stats/hand-records",
@@ -187,6 +210,19 @@ class BridgeStatsApiTests(unittest.TestCase):
         )
         self.assertEqual(report.status_code, 200, report.text)
         self.assertGreaterEqual(report.json()["selected_count"], 1)
+        filtered = self.client.post(
+            "/ffbridge-stats/hand-records",
+            json={
+                "club_or_tournament": "club",
+                "start_date": "2020-01-01",
+                "end_date": "2025-12-31",
+                "players": ["246273"],
+                "sample_size": 100,
+                "table_limit": 10,
+            },
+        )
+        self.assertEqual(filtered.status_code, 200, filtered.text)
+        self.assertGreaterEqual(filtered.json()["selected_count"], 1)
 
 
 if __name__ == "__main__":

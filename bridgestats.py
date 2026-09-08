@@ -26,6 +26,7 @@ import streamlitlib  # must be placed after sys.path.append. vscode re-format li
 
 import bridgestats_api_client as api
 from bridgestats_charts import render_chart_payloads
+import player_sidebar
 
 
 def Stats(club_or_tournament, pair_or_player, chart_options, groupby):
@@ -58,24 +59,11 @@ def Stats(club_or_tournament, pair_or_player, chart_options, groupby):
     else:
         clubs = []
 
-    if pair_or_player == "player":
-        players = st.sidebar.text_input(
-            "Player IDs - Restrict results to these FFBridge / Lancelot player IDs (empty means all).",
-            placeholder="Enter player IDs",
-            value="",
-            key=key_prefix + "-Players",
-            help="Enter zero or more FFBridge player IDs (Lancelot person or license). Use Player Lookup to find an ID.",
-        )
-        players = players.replace(",", " ").replace("_", " ").split()
-        players = [] if players == [""] else players
-        for player in players:
-            if not re.match(r"^\d{3,12}$", player):
-                st.warning(
-                    f"Player {player} has invalid syntax. Expecting numeric FFBridge player IDs. Please correct."
-                )
-                st.stop()
-    else:
-        players = []
+    name_filter, number_filter = player_sidebar.sidebar_player_filters(key_prefix)
+    players = player_sidebar.parse_player_numbers(number_filter)
+    players = player_sidebar.resolve_player_ids(
+        name_filter, players, clubs, key_prefix=key_prefix
+    )
 
     if pair_or_player == "pair":
         pairs = st.sidebar.text_input(
