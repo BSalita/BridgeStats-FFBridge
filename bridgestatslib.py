@@ -1116,10 +1116,13 @@ def player_lookup(
     if numbers_regex:
         df = df.filter(pl.col(id_col).str.contains(numbers_regex))
     if names_regex and "last_name" in df.columns:
-        df = df.filter(pl.col("last_name").str.contains("(?i)" + names_regex))
+        df = df.filter(pl.col("last_name").str.to_lowercase().str.contains(names_regex.lower()))
     drop_mp = [col for col in df.columns if col.startswith("mp_")]
     if drop_mp:
         df = df.drop(drop_mp)
+    sort_cols = [col for col in ("last_name", "first_name", id_col) if col in df.columns]
+    if sort_cols:
+        df = df.sort(sort_cols)
     limit = max(1, min(limit, MAX_LOOKUP_ROWS))
     total = df.height
     return {

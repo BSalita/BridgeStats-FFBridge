@@ -40,6 +40,7 @@ player_names = st.sidebar.text_input(
     "Narrow search to these last names. Enter one or more last names (empty means all):",
     placeholder="Enter list of last names",
     key=key_prefix + "-Last_Name",
+    help="Required to find most players. The table only shows the first 2000 matches.",
 )
 
 with st.spinner(text="Reading data ..."):
@@ -62,7 +63,8 @@ with st.spinner(text="Reading data ..."):
 
 table, charts = st.tabs(["Data Table", "Charts"])
 st.caption(
-    f"Database has {payload.get('total', selected_df.height)} rows. {selected_df.height} rows selected."
+    f"Database has {payload.get('total', selected_df.height)} matching players. "
+    f"Showing {selected_df.height} (cap 2000). Type a last name in the sidebar to search."
 )
 if selected_df.height == 0:
     st.warning("No rows selected")
