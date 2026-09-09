@@ -1,6 +1,6 @@
 """HTTP client for the FFBridge BridgeStats API.
 
-Streamlit and MortyBridgeBot use this instead of importing the library.
+Streamlit and MortyBridgeMCP use this instead of importing the library.
 Configure with BRIDGESTATS_FFBRIDGE_API_BASE_URL (default http://127.0.0.1:8525).
 """
 
