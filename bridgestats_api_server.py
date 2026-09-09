@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import bridgestatslib as service
 
-API_BUILD_TAG = "2026-09-07-ffbridge-stats"
+API_BUILD_TAG = "2026-09-09-history-join"
 app = FastAPI(title="FFBridge BridgeStats API", version="1.0.0")
 
 
@@ -19,6 +19,7 @@ class SqlRequest(BaseModel):
     sql: str
     source: str = "club_board_results"
     limit: int = 500
+    tables: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 
 class BoardResultsRequest(BaseModel):
@@ -95,7 +96,13 @@ def schema(
 
 @app.post("/ffbridge-stats/sql")
 def sql(request: SqlRequest) -> dict:
-    return _run(service.run_sql, request.sql, request.source, request.limit)
+    return _run(
+        service.run_sql,
+        request.sql,
+        request.source,
+        request.limit,
+        extra_tables=request.tables,
+    )
 
 
 @app.get("/ffbridge-stats/players/lookup")

@@ -1172,7 +1172,15 @@ def schema_columns(
     }
 
 
-def run_sql(sql: str, source: str, limit: int = DEFAULT_SQL_ROW_LIMIT) -> Dict[str, Any]:
+_EXTRA_TABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def run_sql(
+    sql: str,
+    source: str,
+    limit: int = DEFAULT_SQL_ROW_LIMIT,
+    extra_tables: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
     if source not in SOURCE_FILES:
         raise ValueError(
             f"Unknown source {source!r}. Expected one of: {', '.join(SOURCE_FILES)}"
@@ -1182,6 +1190,12 @@ def run_sql(sql: str, source: str, limit: int = DEFAULT_SQL_ROW_LIMIT) -> Dict[s
         raise ValueError("sql is required")
     if _SQL_FORBIDDEN.search(sql):
         raise ValueError("SQL contains a forbidden statement")
+    extras = extra_tables or {}
+    for name, rows in extras.items():
+        if not _EXTRA_TABLE_NAME.fullmatch(name) or name == source:
+            raise ValueError(f"Invalid extra table name: {name}")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError(f"Extra table {name} must be a non-empty list of rows")
     limit = max(1, min(limit or DEFAULT_SQL_ROW_LIMIT, MAX_SQL_ROW_LIMIT))
     path = resolve_source_path(source)
     escaped = str(path).replace("'", "''")
@@ -1190,8 +1204,10 @@ def run_sql(sql: str, source: str, limit: int = DEFAULT_SQL_ROW_LIMIT) -> Dict[s
     con = duckdb.connect()
     try:
         con.execute(f"CREATE VIEW {source} AS SELECT * FROM read_parquet('{escaped}')")
-        if source != CON_REGISTER_NAME:
+        if source != CON_REGISTER_NAME and CON_REGISTER_NAME not in extras:
             con.execute(f"CREATE VIEW {CON_REGISTER_NAME} AS SELECT * FROM {source}")
+        for name, rows in extras.items():
+            con.register(name, pl.DataFrame(rows))
         result = con.execute(sql).pl()
     finally:
         con.close()

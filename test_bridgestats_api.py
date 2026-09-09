@@ -158,6 +158,25 @@ class BridgeStatsApiTests(unittest.TestCase):
         )
         self.assertEqual(sql.status_code, 200)
         self.assertGreaterEqual(sql.json()["row_count"], 1)
+        joined = self.client.post(
+            "/ffbridge-stats/sql",
+            json={
+                "sql": (
+                    "SELECT h.tournament_id, AVG(s.Declarer_Pct) AS mean_declarer_pct "
+                    "FROM self h LEFT JOIN club_board_results s "
+                    "ON s.session_id = h.tournament_id GROUP BY h.tournament_id"
+                ),
+                "source": "club_board_results",
+                "tables": {
+                    "self": [
+                        {"tournament_id": "s1", "pair_name": "Salita - Flom"},
+                    ]
+                },
+            },
+        )
+        self.assertEqual(joined.status_code, 200, joined.text)
+        self.assertEqual(joined.json()["row_count"], 1)
+        self.assertAlmostEqual(joined.json()["rows"][0]["mean_declarer_pct"], 0.5)
         report = self.client.post(
             "/ffbridge-stats/board-results",
             json={

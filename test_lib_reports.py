@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import datetime
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import polars as pl
 
@@ -70,6 +73,27 @@ class ReportLibTests(unittest.TestCase):
             lib.run_sql("SELECT 1", "not_a_source")
         with self.assertRaises(ValueError):
             lib.run_sql("COPY self TO 'x.csv'", "club_board_results")
+
+    def test_run_sql_joins_extra_self_table(self) -> None:
+        boards = pl.DataFrame(
+            {
+                "session_id": ["s1", "s1"],
+                "Declarer_Pct": [0.6, 0.4],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "boards.parquet"
+            boards.write_parquet(path)
+            with patch.object(lib, "resolve_source_path", return_value=path):
+                payload = lib.run_sql(
+                    "SELECT h.tournament_id, AVG(s.Declarer_Pct) AS mean_pct "
+                    "FROM self h LEFT JOIN club_board_results s "
+                    "ON s.session_id = h.tournament_id GROUP BY h.tournament_id",
+                    "club_board_results",
+                    extra_tables={"self": [{"tournament_id": "s1"}]},
+                )
+        self.assertEqual(payload["row_count"], 1)
+        self.assertAlmostEqual(payload["rows"][0]["mean_pct"], 0.5)
 
     def test_frame_to_table_round_trip(self) -> None:
         table = lib.frame_to_table(_selected_df(), limit=1)
