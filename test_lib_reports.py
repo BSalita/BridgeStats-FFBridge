@@ -188,6 +188,61 @@ class ReportLibTests(unittest.TestCase):
         )
         self.assertEqual(ranked["player_id"].to_list(), ["2", "1"])
 
+    def test_schema_advertises_fabricated_contract(self) -> None:
+        items = lib.inject_fabricated_contract_columns(
+            "club_board_results",
+            [
+                {"name": "BidLvl", "dtype": "UInt8"},
+                {"name": "BidSuit", "dtype": "String"},
+                {"name": "Dbl", "dtype": "String"},
+                {"name": "Declarer_Direction", "dtype": "String"},
+            ],
+        )
+        self.assertEqual(
+            [item["name"] for item in items],
+            ["BidLvl", "BidSuit", "Dbl", "Contract", "Declarer_Direction"],
+        )
+        self.assertFalse(lib.sql_requests_contract("SELECT ContractType FROM self"))
+        self.assertTrue(lib.sql_requests_contract("SELECT s.Contract FROM self"))
+
+    def test_run_sql_fabricates_contract_on_request(self) -> None:
+        boards = pl.DataFrame(
+            {
+                "session_id": ["s1", "s1", "s1"],
+                "BidLvl": [4, None, 1],
+                "BidSuit": ["H", None, "C"],
+                "Dbl": ["", None, "X"],
+                "Declarer_Direction": ["N", None, "W"],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "boards.parquet"
+            boards.write_parquet(path)
+            with patch.object(lib, "resolve_source_path", return_value=path):
+                payload = lib.run_sql(
+                    "SELECT Contract FROM self ORDER BY Contract",
+                    "club_board_results",
+                )
+                untouched = lib.run_sql(
+                    "SELECT BidLvl FROM self",
+                    "club_board_results",
+                )
+        self.assertEqual(
+            [row["Contract"] for row in payload["rows"]],
+            ["1CXW", "4HN", "PASS"],
+        )
+        self.assertNotIn("Contract", untouched["columns"])
+
+    def test_run_sql_cannot_fabricate_contract_without_pieces(self) -> None:
+        boards = pl.DataFrame({"session_id": ["s1"], "Declarer_Pct": [0.5]})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "boards.parquet"
+            boards.write_parquet(path)
+            with patch.object(lib, "resolve_source_path", return_value=path):
+                with self.assertRaises(ValueError) as exc:
+                    lib.run_sql("SELECT Contract FROM self", "club_board_results")
+        self.assertIn("cannot be fabricated", str(exc.exception))
+
     def test_club_probe_skips_optional_club_column(self) -> None:
         _filename, required, optional = lib.SOURCE_FILES["club_board_results"]
         probe = lib.source_probe_columns(required, optional)

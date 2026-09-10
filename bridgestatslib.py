@@ -181,6 +181,76 @@ _SQL_FORBIDDEN = re.compile(
     r"\b(COPY|INSTALL|LOAD|ATTACH|EXPORT|PRAGMA|CALL|SET)\b",
     re.IGNORECASE,
 )
+_SQL_CONTRACT_NAME = re.compile(r"\bContract\b", re.IGNORECASE)
+CONTRACT_PIECE_COLUMNS = ("BidLvl", "BidSuit", "Dbl", "Declarer_Direction")
+# ACBL/FFBridge postmortem form: 4HS, 3NW, 1CXW. PASS when BidLvl is missing.
+FABRICATED_CONTRACT_SQL = (
+    "CASE "
+    "WHEN BidLvl IS NULL OR BidLvl = 0 THEN 'PASS' "
+    "ELSE CAST(BidLvl AS VARCHAR) "
+    "|| COALESCE(CAST(BidSuit AS VARCHAR), '') "
+    "|| COALESCE(CAST(Dbl AS VARCHAR), '') "
+    "|| COALESCE(CAST(Declarer_Direction AS VARCHAR), '') "
+    "END"
+)
+
+
+def sql_requests_contract(sql: str) -> bool:
+    return bool(_SQL_CONTRACT_NAME.search(sql or ""))
+
+
+def can_fabricate_contract(column_names: Iterable[str]) -> bool:
+    names = set(column_names)
+    return "Contract" not in names and set(CONTRACT_PIECE_COLUMNS).issubset(names)
+
+
+def inject_fabricated_contract_columns(
+    source: str, columns: List[Any]
+) -> List[Any]:
+    """Advertise Contract on club_board_results when it can be built from pieces."""
+    if source != "club_board_results" or not columns:
+        return columns
+    if isinstance(columns[0], dict):
+        names = [str(item.get("name")) for item in columns]
+        if not can_fabricate_contract(names):
+            return columns
+        injected = [dict(item) for item in columns]
+        contract = {"name": "Contract", "dtype": "String"}
+        if "Dbl" in names:
+            injected.insert(names.index("Dbl") + 1, contract)
+        else:
+            injected.append(contract)
+        return injected
+    names = [str(name) for name in columns]
+    if not can_fabricate_contract(names):
+        return columns
+    injected = list(names)
+    if "Dbl" in injected:
+        injected.insert(injected.index("Dbl") + 1, "Contract")
+    else:
+        injected.append("Contract")
+    return injected
+
+
+def board_results_view_sql(
+    escaped_path: str,
+    column_names: Iterable[str],
+    *,
+    include_contract: bool,
+) -> str:
+    names = set(column_names)
+    if include_contract and "Contract" not in names:
+        missing = [name for name in CONTRACT_PIECE_COLUMNS if name not in names]
+        if missing:
+            raise ValueError(
+                "Contract is not stored and cannot be fabricated; "
+                f"missing {', '.join(missing)}"
+            )
+        return (
+            f"SELECT src.*, {FABRICATED_CONTRACT_SQL} AS Contract "
+            f"FROM read_parquet('{escaped_path}') AS src"
+        )
+    return f"SELECT * FROM read_parquet('{escaped_path}')"
 
 
 def resolve_data_path() -> pathlib.Path:
@@ -1131,12 +1201,13 @@ def dataset_info() -> Dict[str, Any]:
                 filename, required_columns=source_probe_columns(required, optional)
             )
             schema = pl.read_parquet_schema(str(path))
+            columns = inject_fabricated_contract_columns(source, list(schema.keys()))
             sources[source] = {
                 "available": True,
                 "filename": filename,
                 "path": str(path),
-                "columns": list(schema.keys()),
-                "column_count": len(schema),
+                "columns": columns,
+                "column_count": len(columns),
             }
         except FileNotFoundError as exc:
             sources[source] = {
@@ -1158,7 +1229,10 @@ def schema_columns(
 ) -> Dict[str, Any]:
     path = resolve_source_path(source)
     schema = pl.read_parquet_schema(str(path))
-    items = [{"name": name, "dtype": str(dtype)} for name, dtype in schema.items()]
+    items = inject_fabricated_contract_columns(
+        source,
+        [{"name": name, "dtype": str(dtype)} for name, dtype in schema.items()],
+    )
     if pattern:
         regex = re.compile(pattern, re.IGNORECASE)
         items = [item for item in items if regex.search(item["name"])]
@@ -1199,11 +1273,17 @@ def run_sql(
     limit = max(1, min(limit or DEFAULT_SQL_ROW_LIMIT, MAX_SQL_ROW_LIMIT))
     path = resolve_source_path(source)
     escaped = str(path).replace("'", "''")
+    schema_names = pl.read_parquet_schema(str(path)).keys()
+    view_sql = board_results_view_sql(
+        escaped,
+        schema_names,
+        include_contract=source == "club_board_results" and sql_requests_contract(sql),
+    )
     if f"from {CON_REGISTER_NAME}" not in sql.lower() and f"from {source}" not in sql.lower():
         sql = f"FROM {CON_REGISTER_NAME} " + sql
     con = duckdb.connect()
     try:
-        con.execute(f"CREATE VIEW {source} AS SELECT * FROM read_parquet('{escaped}')")
+        con.execute(f"CREATE VIEW {source} AS {view_sql}")
         if source != CON_REGISTER_NAME and CON_REGISTER_NAME not in extras:
             con.execute(f"CREATE VIEW {CON_REGISTER_NAME} AS SELECT * FROM {source}")
         for name, rows in extras.items():

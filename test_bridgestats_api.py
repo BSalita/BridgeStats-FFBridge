@@ -158,6 +158,27 @@ class BridgeStatsApiTests(unittest.TestCase):
         )
         self.assertEqual(sql.status_code, 200)
         self.assertGreaterEqual(sql.json()["row_count"], 1)
+        schema = self.client.get(
+            "/ffbridge-stats/schema",
+            params={"source": "club_board_results", "pattern": "Contract"},
+        )
+        self.assertEqual(schema.status_code, 200)
+        self.assertIn(
+            "Contract",
+            [item["name"] for item in schema.json()["columns"]],
+        )
+        contracts = self.client.post(
+            "/ffbridge-stats/sql",
+            json={
+                "sql": "SELECT Contract FROM self ORDER BY Contract",
+                "source": "club_board_results",
+            },
+        )
+        self.assertEqual(contracts.status_code, 200, contracts.text)
+        self.assertEqual(
+            [row["Contract"] for row in contracts.json()["rows"]],
+            ["4HN", "4HS"],
+        )
         joined = self.client.post(
             "/ffbridge-stats/sql",
             json={
