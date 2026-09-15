@@ -73,6 +73,7 @@ BOARD_RESULT_COLUMNS = (
     "Declarer_Pct",
     "HandRecordBoard",
     "Board",
+    "Dealer",
     "Result",
     "BidLvl",
     "BidSuit",
@@ -85,6 +86,9 @@ BOARD_RESULT_COLUMNS = (
 BOARD_RESULT_OPTIONAL_COLUMNS = (
     "Club",
     "Declarer",
+    # TODO: Remove Dealer from optional columns and remove its virtual-column
+    # support after the next published parquet rebuild persists Dealer.
+    "Dealer",
     "Player_Name_N",
     "Player_Name_E",
     "Player_Name_S",
@@ -182,6 +186,7 @@ _SQL_FORBIDDEN = re.compile(
     re.IGNORECASE,
 )
 _SQL_CONTRACT_NAME = re.compile(r"\bContract\b", re.IGNORECASE)
+_SQL_DEALER_NAME = re.compile(r"\bDealer\b", re.IGNORECASE)
 CONTRACT_PIECE_COLUMNS = ("BidLvl", "BidSuit", "Dbl", "Declarer_Direction")
 # ACBL/FFBridge postmortem form: 4HS, 3NW, 1CXW. PASS when BidLvl is missing.
 FABRICATED_CONTRACT_SQL = (
@@ -193,10 +198,22 @@ FABRICATED_CONTRACT_SQL = (
     "|| COALESCE(CAST(Declarer_Direction AS VARCHAR), '') "
     "END"
 )
+FABRICATED_DEALER_SQL = (
+    "CASE ((TRY_CAST(Board AS BIGINT) - 1) % 4) "
+    "WHEN 0 THEN 'N' "
+    "WHEN 1 THEN 'E' "
+    "WHEN 2 THEN 'S' "
+    "WHEN 3 THEN 'W' "
+    "END"
+)
 
 
 def sql_requests_contract(sql: str) -> bool:
     return bool(_SQL_CONTRACT_NAME.search(sql or ""))
+
+
+def sql_requests_dealer(sql: str) -> bool:
+    return bool(_SQL_DEALER_NAME.search(sql or ""))
 
 
 def can_fabricate_contract(column_names: Iterable[str]) -> bool:
@@ -232,13 +249,49 @@ def inject_fabricated_contract_columns(
     return injected
 
 
+def can_fabricate_dealer(column_names: Iterable[str]) -> bool:
+    names = set(column_names)
+    return "Dealer" not in names and "Board" in names
+
+
+def inject_fabricated_dealer_columns(
+    source: str, columns: List[Any]
+) -> List[Any]:
+    """Advertise Dealer until rebuilt club board-result parquets persist it."""
+    if source != "club_board_results" or not columns:
+        return columns
+    if isinstance(columns[0], dict):
+        names = [str(item.get("name")) for item in columns]
+        if not can_fabricate_dealer(names):
+            return columns
+        injected = [dict(item) for item in columns]
+        injected.insert(
+            names.index("Board") + 1,
+            {"name": "Dealer", "dtype": "String"},
+        )
+        return injected
+    names = [str(name) for name in columns]
+    if not can_fabricate_dealer(names):
+        return columns
+    injected = list(names)
+    injected.insert(injected.index("Board") + 1, "Dealer")
+    return injected
+
+
+def inject_fabricated_columns(source: str, columns: List[Any]) -> List[Any]:
+    columns = inject_fabricated_contract_columns(source, columns)
+    return inject_fabricated_dealer_columns(source, columns)
+
+
 def board_results_view_sql(
     escaped_path: str,
     column_names: Iterable[str],
     *,
     include_contract: bool,
+    include_dealer: bool,
 ) -> str:
     names = set(column_names)
+    additions = []
     if include_contract and "Contract" not in names:
         missing = [name for name in CONTRACT_PIECE_COLUMNS if name not in names]
         if missing:
@@ -246,8 +299,14 @@ def board_results_view_sql(
                 "Contract is not stored and cannot be fabricated; "
                 f"missing {', '.join(missing)}"
             )
+        additions.append(f"{FABRICATED_CONTRACT_SQL} AS Contract")
+    if include_dealer and "Dealer" not in names:
+        if "Board" not in names:
+            raise ValueError("Dealer is not stored and cannot be fabricated; missing Board")
+        additions.append(f"{FABRICATED_DEALER_SQL} AS Dealer")
+    if additions:
         return (
-            f"SELECT src.*, {FABRICATED_CONTRACT_SQL} AS Contract "
+            f"SELECT src.*, {', '.join(additions)} "
             f"FROM read_parquet('{escaped_path}') AS src"
         )
     return f"SELECT * FROM read_parquet('{escaped_path}')"
@@ -1201,7 +1260,7 @@ def dataset_info() -> Dict[str, Any]:
                 filename, required_columns=source_probe_columns(required, optional)
             )
             schema = pl.read_parquet_schema(str(path))
-            columns = inject_fabricated_contract_columns(source, list(schema.keys()))
+            columns = inject_fabricated_columns(source, list(schema.keys()))
             sources[source] = {
                 "available": True,
                 "filename": filename,
@@ -1229,7 +1288,7 @@ def schema_columns(
 ) -> Dict[str, Any]:
     path = resolve_source_path(source)
     schema = pl.read_parquet_schema(str(path))
-    items = inject_fabricated_contract_columns(
+    items = inject_fabricated_columns(
         source,
         [{"name": name, "dtype": str(dtype)} for name, dtype in schema.items()],
     )
@@ -1278,6 +1337,7 @@ def run_sql(
         escaped,
         schema_names,
         include_contract=source == "club_board_results" and sql_requests_contract(sql),
+        include_dealer=source == "club_board_results" and sql_requests_dealer(sql),
     )
     if f"from {CON_REGISTER_NAME}" not in sql.lower() and f"from {source}" not in sql.lower():
         sql = f"FROM {CON_REGISTER_NAME} " + sql

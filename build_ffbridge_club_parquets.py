@@ -61,6 +61,35 @@ def _as_date_expr(frame: pl.DataFrame, name: str) -> pl.Expr:
     return pl.col(name).cast(pl.Utf8).str.to_datetime(strict=False).cast(pl.Date)
 
 
+def _with_dealer(frame: pl.DataFrame) -> pl.DataFrame:
+    board_number = pl.col("Board").cast(pl.Int64, strict=False)
+    dealer_from_board = (
+        pl.when(board_number.is_null() | (board_number <= 0))
+        .then(pl.lit(None, dtype=pl.Utf8))
+        .when(((board_number - 1) % 4) == 0)
+        .then(pl.lit("N"))
+        .when(((board_number - 1) % 4) == 1)
+        .then(pl.lit("E"))
+        .when(((board_number - 1) % 4) == 2)
+        .then(pl.lit("S"))
+        .otherwise(pl.lit("W"))
+    )
+    if "Dealer" not in frame.columns:
+        return frame.with_columns(dealer_from_board.alias("Dealer"))
+    supplied_dealer = (
+        pl.col("Dealer")
+        .cast(pl.Utf8)
+        .str.to_uppercase()
+        .replace({"O": "W"})
+    )
+    return frame.with_columns(
+        pl.when(supplied_dealer.is_in(SEATS))
+        .then(supplied_dealer)
+        .otherwise(dealer_from_board)
+        .alias("Dealer")
+    )
+
+
 def _parse_session_date(payload: Mapping[str, Any]) -> Optional[datetime.date]:
     candidates: List[Any] = [payload.get("date"), payload.get("startDate")]
     candidates.extend(
@@ -147,6 +176,7 @@ def _attach_board_lookup(boards: pl.DataFrame, lookup: pl.DataFrame) -> pl.DataF
     if drop:
         out = out.drop(drop)
     out = out.join(meta, on="session_id", how="left")
+    out = _with_dealer(out)
     return out.select(list(BOARD_RESULT_COLUMNS))
 
 
@@ -368,6 +398,8 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
             out = out.with_columns(pl.col(src).alias(dest))
         else:
             out = out.with_columns(pl.lit(default).alias(dest))
+
+    out = _with_dealer(out)
 
     string_defaults = {
         "Vul_Declarer": "None",
