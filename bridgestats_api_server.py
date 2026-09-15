@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import duckdb
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -64,7 +65,7 @@ class HandRecordsRequest(BaseModel):
 def _run(callable_, /, *args, **kwargs):
     try:
         return callable_(*args, **kwargs)
-    except (FileNotFoundError, KeyError, ValueError) as exc:
+    except (duckdb.Error, FileNotFoundError, KeyError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

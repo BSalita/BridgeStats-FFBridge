@@ -179,6 +179,15 @@ class BridgeStatsApiTests(unittest.TestCase):
             [row["Contract"] for row in contracts.json()["rows"]],
             ["4HN", "4HS"],
         )
+        invalid = self.client.post(
+            "/ffbridge-stats/sql",
+            json={
+                "sql": "SELECT MissingColumn FROM self",
+                "source": "club_board_results",
+            },
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertIn("MissingColumn", invalid.json()["detail"])
         joined = self.client.post(
             "/ffbridge-stats/sql",
             json={
