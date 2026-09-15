@@ -36,4 +36,9 @@ Expected files:
 - `ffbridge_player_info.parquet`
 - `ffbridge_clubs.parquet`
 
+`club_board_results` exposes `Dealer` as a normal SQL/schema column. Until the
+next full parquet rebuild persists it, the API supplies `Dealer` virtually from
+the standard duplicate-board rotation. Remove that compatibility layer after
+the rebuilt parquet is published.
+
 Search roots: `BRIDGESTATS_FFBRIDGE_DATA_DIR`, `data/`, `E:\bridge\data\ffbridge`.
