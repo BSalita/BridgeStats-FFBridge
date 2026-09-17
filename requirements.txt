@@ -15,4 +15,5 @@ seaborn
 streamlit
 streamlit-aggrid==1.1.8.post1
 streamlit-extras
+tqdm
 uvicorn

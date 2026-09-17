@@ -47,6 +47,26 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(out["OnLead"][0], "2")
         self.assertEqual(out["NotOnLead"][0], "4")
 
+    def test_quality_unsupported_ids_read_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "quality_cache"
+            cache.mkdir()
+            (cache / "ffbridge_quality_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "unsupported_sessions": [
+                            {"session_id": "38930", "reason": "no PBN"},
+                            {"session_id": 38112, "reason": "no contract"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            got = builder._quality_unsupported_ids(root / "data")
+            self.assertEqual(got["38930"], "no PBN")
+            self.assertEqual(got["38112"], "no contract")
+
     def test_from_quality_cache_skips_training_parquet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -149,6 +169,19 @@ class BuilderTests(unittest.TestCase):
             self.assertEqual(got_hands.height, hands.height)
             self.assertEqual(players.height, 6)
             self.assertEqual(clubs.height, 1)
+
+    def test_read_club_fragments_unifies_vul_declarer_dtypes(self) -> None:
+        boards, hands, _players, _clubs = builder.demo_frames()
+        bool_boards = boards.with_columns(pl.lit(True).alias("Vul_Declarer"))
+        str_boards = boards.with_columns(pl.lit("N").alias("Vul_Declarer"))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            builder.write_session_fragments(out, "bool", bool_boards, hands)
+            builder.write_session_fragments(out, "str", str_boards, hands)
+            got_boards, _got_hands = builder.read_club_fragments(out, ["bool", "str"])
+            assert got_boards is not None
+            self.assertEqual(got_boards.schema["Vul_Declarer"], pl.String)
+            self.assertEqual(sorted(got_boards["Vul_Declarer"].unique().to_list()), ["N", "Y"])
 
 
 if __name__ == "__main__":

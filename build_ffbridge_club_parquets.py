@@ -19,7 +19,9 @@ import gc
 import json
 import pathlib
 import sys
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import polars as pl
 
@@ -739,7 +741,33 @@ def _concat_parquet_paths(paths: Sequence[pathlib.Path]) -> Optional[pl.DataFram
         return None
     if len(existing) == 1:
         return pl.read_parquet(existing[0])
-    return pl.scan_parquet(existing).collect()
+    # Fragments were written across schema revisions (e.g. Vul_Declarer
+    # Boolean vs String). scan_parquet(list) requires one schema.
+    return pl.concat(
+        [pl.scan_parquet(path) for path in existing],
+        how="diagonal_relaxed",
+    ).collect()
+
+
+def _normalize_vul_declarer(frame: pl.DataFrame) -> pl.DataFrame:
+    if "Vul_Declarer" not in frame.columns:
+        return frame
+    if frame.schema["Vul_Declarer"] == pl.Boolean:
+        return frame.with_columns(
+            pl.when(pl.col("Vul_Declarer"))
+            .then(pl.lit("Y"))
+            .otherwise(pl.lit("N"))
+            .alias("Vul_Declarer")
+        )
+    text = pl.col("Vul_Declarer").cast(pl.Utf8).str.to_lowercase()
+    return frame.with_columns(
+        pl.when(text.is_in(["true", "1", "y"]))
+        .then(pl.lit("Y"))
+        .when(text.is_in(["false", "0", "n"]))
+        .then(pl.lit("N"))
+        .otherwise(pl.col("Vul_Declarer").cast(pl.Utf8))
+        .alias("Vul_Declarer")
+    )
 
 
 def read_club_fragments(
@@ -754,21 +782,82 @@ def read_club_fragments(
         if hand_path.is_file():
             hand_paths.append(hand_path)
     boards = _concat_parquet_paths(board_paths)
+    if boards is not None:
+        boards = _normalize_vul_declarer(boards)
     hands = _concat_parquet_paths(hand_paths)
     if hands is not None and "PBN" in hands.columns:
         hands = hands.unique(subset=["PBN"], maintain_order=True)
     return boards, hands
 
 
+def _quality_unsupported_ids(source_dir: pathlib.Path) -> Dict[str, str]:
+    metadata_path = pathlib.Path(source_dir).parent / "quality_cache" / (
+        "ffbridge_quality_metadata.json"
+    )
+    if not metadata_path.is_file():
+        return {}
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    return {
+        str(item["session_id"]): str(item.get("reason") or "unsupported by quality cache")
+        for item in payload.get("unsupported_sessions") or []
+        if item.get("session_id")
+    }
+
+
+def _overlay_session_lookup(
+    frame: pl.DataFrame, lookup: pl.DataFrame, session_id: str
+) -> pl.DataFrame:
+    meta = lookup.filter(pl.col("session_id") == str(session_id))
+    if meta.height == 0:
+        return frame
+    rec = meta.row(0, named=True)
+    overlays = []
+    if rec.get("Date") is not None:
+        overlays.append(pl.lit(rec["Date"]).alias("Date"))
+    if rec.get("Club"):
+        overlays.append(pl.lit(rec["Club"]).alias("Club"))
+        overlays.append(pl.lit(rec.get("club_name") or "").alias("club_name"))
+    if not overlays:
+        return frame
+    return frame.with_columns(*overlays)
+
+
+def _process_club_session(
+    session: Any,
+    *,
+    source_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    lookup: pl.DataFrame,
+    load_raw_session: Any,
+    augment_raw_session: Any,
+) -> Tuple[str, str, Optional[pl.DataFrame], Optional[str]]:
+    board_path, hand_path = _fragment_paths(output_dir, session.session_id)
+    if board_path.is_file() and hand_path.is_file():
+        return session.session_id, "resume", pl.read_parquet(board_path), None
+    raw, _unmapped = load_raw_session(source_dir, session)
+    if "Date" not in raw.columns and session.session_date:
+        raw = raw.with_columns(pl.lit(session.session_date).alias("Date"))
+    augmented = augment_raw_session(raw)
+    del raw
+    augmented = _overlay_session_lookup(augmented, lookup, session.session_id)
+    boards, hands, _players, _clubs = build_from_frame(augmented)
+    del augmented
+    write_session_fragments(output_dir, session.session_id, boards, hands)
+    return session.session_id, "augment", boards, None
+
+
 def _try_write_from_quality_cache(
     source_dir: pathlib.Path,
     output_dir: pathlib.Path,
     limit: Optional[int],
+    workers: int = 8,
 ) -> Optional[Dict[str, str]]:
     """Augment one session at a time and persist slim Club fragments.
 
     Holding every mlBridge frame until a final concat OOMs on the full
     historical cache. Fragments also let a rerun resume after a crash.
+    Sessions already marked unusable by the quality cache are skipped
+    without reloading their team JSON.
     """
     elo_dir = pathlib.Path(__file__).resolve().parent.parent / "elo"
     if str(elo_dir) not in sys.path:
@@ -787,10 +876,27 @@ def _try_write_from_quality_cache(
     except Exception as exc:
         print(f"[ffbridge-stats-builder] cache audit failed: {exc}", flush=True)
         return None
+    unsupported = _quality_unsupported_ids(source_dir)
     complete = [session for session in audit.sessions if session.complete]
+    skipped_known = [session for session in complete if session.session_id in unsupported]
+    complete = [
+        session for session in complete if session.session_id not in unsupported
+    ]
+    if skipped_known:
+        print(
+            f"[ffbridge-stats-builder] skipping {len(skipped_known)} sessions "
+            "already marked unusable by the quality cache",
+            flush=True,
+        )
     if limit:
         complete = complete[:limit]
-    print(f"[ffbridge-stats-builder] augmenting {len(complete)} cached sessions", flush=True)
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    print(
+        f"[ffbridge-stats-builder] augmenting {len(complete)} cached sessions "
+        f"({workers} worker(s))",
+        flush=True,
+    )
     lookup = load_session_lookup(source_dir)
     kept_ids: List[str] = []
     player_acc: List[pl.DataFrame] = []
@@ -798,53 +904,86 @@ def _try_write_from_quality_cache(
     empty_players = pl.DataFrame(
         {"player_id": [], "first_name": [], "last_name": [], "club": []}
     )
-    empty_clubs = pl.DataFrame({"id": [], "name": []})
-    for index, session in enumerate(complete, start=1):
-        board_path, hand_path = _fragment_paths(output_dir, session.session_id)
-        try:
-            if board_path.is_file() and hand_path.is_file():
-                boards = pl.read_parquet(board_path)
-                status = "resume"
-            else:
-                raw, _unmapped = load_raw_session(source_dir, session)
-                if "Date" not in raw.columns and session.session_date:
-                    raw = raw.with_columns(pl.lit(session.session_date).alias("Date"))
-                augmented = augment_raw_session(raw)
-                del raw
-                meta = lookup.filter(
-                    pl.col("session_id") == str(session.session_id)
+    from tqdm import tqdm
+
+    def _record(
+        session_id: str,
+        status: str,
+        boards: Optional[pl.DataFrame],
+        error: Optional[str],
+        index: int,
+        total: int,
+    ) -> None:
+        if error is not None:
+            print(
+                f"[ffbridge-stats-builder] skip session {session_id}: {error}",
+                flush=True,
+            )
+            return
+        assert boards is not None
+        kept_ids.append(session_id)
+        nonlocal player_acc, club_acc
+        player_acc = _extend_unique(player_acc, map_players(boards), "player_id")
+        club_acc = _extend_unique(club_acc, map_clubs(boards), "id")
+        print(
+            f"[ffbridge-stats-builder] {index}/{total} session {session_id} {status}",
+            flush=True,
+        )
+
+    if workers == 1:
+        iterator = tqdm(complete, desc="Club sessions")
+        for index, session in enumerate(iterator, start=1):
+            try:
+                session_id, status, boards, error = _process_club_session(
+                    session,
+                    source_dir=source_dir,
+                    output_dir=output_dir,
+                    lookup=lookup,
+                    load_raw_session=load_raw_session,
+                    augment_raw_session=augment_raw_session,
                 )
-                if meta.height:
-                    rec = meta.row(0, named=True)
-                    overlays = []
-                    if rec.get("Date") is not None:
-                        overlays.append(pl.lit(rec["Date"]).alias("Date"))
-                    if rec.get("Club"):
-                        overlays.append(pl.lit(rec["Club"]).alias("Club"))
-                        overlays.append(
-                            pl.lit(rec.get("club_name") or "").alias("club_name")
-                        )
-                    if overlays:
-                        augmented = augmented.with_columns(*overlays)
-                boards, hands, _players, _clubs = build_from_frame(augmented)
-                del augmented
-                write_session_fragments(output_dir, session.session_id, boards, hands)
-                status = "augment"
-            kept_ids.append(session.session_id)
-            player_acc = _extend_unique(player_acc, map_players(boards), "player_id")
-            club_acc = _extend_unique(club_acc, map_clubs(boards), "id")
-            print(
-                f"[ffbridge-stats-builder] {index}/{len(complete)} "
-                f"session {session.session_id} {status}",
-                flush=True,
-            )
-        except Exception as exc:
-            print(
-                f"[ffbridge-stats-builder] skip session {session.session_id}: {exc}",
-                flush=True,
-            )
-        if index % 50 == 0:
-            gc.collect()
+            except Exception as exc:
+                session_id, status, boards, error = (
+                    session.session_id,
+                    "skip",
+                    None,
+                    str(exc),
+                )
+            _record(session_id, status, boards, error, index, len(complete))
+            if index % 50 == 0:
+                gc.collect()
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _process_club_session,
+                    session,
+                    source_dir=source_dir,
+                    output_dir=output_dir,
+                    lookup=lookup,
+                    load_raw_session=load_raw_session,
+                    augment_raw_session=augment_raw_session,
+                ): session
+                for session in complete
+            }
+            done = 0
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Club sessions"
+            ):
+                session = futures[future]
+                done += 1
+                try:
+                    session_id, status, boards, error = future.result()
+                except Exception as exc:
+                    session_id, status, boards, error = (
+                        session.session_id,
+                        "skip",
+                        None,
+                        str(exc),
+                    )
+                _record(session_id, status, boards, error, done, len(complete))
+                if done % 50 == 0:
+                    gc.collect()
     boards, hands = read_club_fragments(output_dir, kept_ids)
     if boards is None or boards.height == 0:
         return None
@@ -882,6 +1021,7 @@ def build(
     demo: bool = False,
     session_limit: Optional[int] = None,
     from_quality_cache: bool = False,
+    workers: int = 8,
 ) -> Dict[str, str]:
     if demo:
         boards, hands, players, clubs = demo_frames()
@@ -890,7 +1030,9 @@ def build(
     if from_quality_cache:
         if not source_dir:
             raise ValueError("--from-quality-cache requires --source-dir")
-        written = _try_write_from_quality_cache(source_dir, output_dir, session_limit)
+        written = _try_write_from_quality_cache(
+            source_dir, output_dir, session_limit, workers=workers
+        )
         if written:
             return written
         raise FileNotFoundError(
@@ -907,7 +1049,7 @@ def build(
             frame = _load_training_or_augmented(training)
         else:
             written = _try_write_from_quality_cache(
-                source_dir, output_dir, session_limit
+                source_dir, output_dir, session_limit, workers=workers
             )
             if written:
                 return written
@@ -953,6 +1095,12 @@ def _parser() -> argparse.ArgumentParser:
         help="When augmenting from cache, process at most this many sessions.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Concurrent session augment workers (default: 8).",
+    )
+    parser.add_argument(
         "--repair-from-metadata",
         action="store_true",
         help="Fill Date/Club on existing Club parquets from session metadata.",
@@ -962,23 +1110,36 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
+    started = datetime.datetime.now()
+    started_clock = time.perf_counter()
+    print(f"[ffbridge-stats-builder] start {started.isoformat(timespec='seconds')}", flush=True)
     output_dir = args.output_dir or resolve_data_path()
-    if args.repair_from_metadata:
-        if not args.source_dir:
-            raise ValueError("--repair-from-metadata requires --source-dir")
-        written = repair_outputs_from_metadata(output_dir, args.source_dir)
+    try:
+        if args.repair_from_metadata:
+            if not args.source_dir:
+                raise ValueError("--repair-from-metadata requires --source-dir")
+            written = repair_outputs_from_metadata(output_dir, args.source_dir)
+            print(json.dumps({"output_dir": str(output_dir), "files": written}, indent=2))
+            return 0
+        written = build(
+            output_dir=output_dir,
+            source_dir=args.source_dir,
+            training_parquet=args.training_parquet,
+            demo=args.demo,
+            session_limit=args.session_limit,
+            from_quality_cache=args.from_quality_cache,
+            workers=args.workers,
+        )
         print(json.dumps({"output_dir": str(output_dir), "files": written}, indent=2))
         return 0
-    written = build(
-        output_dir=output_dir,
-        source_dir=args.source_dir,
-        training_parquet=args.training_parquet,
-        demo=args.demo,
-        session_limit=args.session_limit,
-        from_quality_cache=args.from_quality_cache,
-    )
-    print(json.dumps({"output_dir": str(output_dir), "files": written}, indent=2))
-    return 0
+    finally:
+        ended = datetime.datetime.now()
+        elapsed = time.perf_counter() - started_clock
+        print(
+            f"[ffbridge-stats-builder] end {ended.isoformat(timespec='seconds')} "
+            f"(elapsed {elapsed:.1f}s)",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
