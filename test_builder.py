@@ -47,6 +47,14 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(out["OnLead"][0], "2")
         self.assertEqual(out["NotOnLead"][0], "4")
 
+    def test_club_fragment_without_ev_is_rebuilt(self) -> None:
+        boards, _hands, _players, _clubs = builder.demo_frames()
+        self.assertTrue(builder._club_fragment_has_ev(boards))
+        empty = boards.with_columns(pl.lit(0).alias("EV_Score_Declarer"))
+        self.assertFalse(builder._club_fragment_has_ev(empty))
+        missing = boards.drop("EV_Score_Declarer")
+        self.assertFalse(builder._club_fragment_has_ev(missing))
+
     def test_quality_unsupported_ids_read_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

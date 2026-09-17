@@ -790,6 +790,13 @@ def read_club_fragments(
     return boards, hands
 
 
+def _club_fragment_has_ev(boards: pl.DataFrame) -> bool:
+    if "EV_Score_Declarer" not in boards.columns:
+        return False
+    values = boards["EV_Score_Declarer"].drop_nulls()
+    return values.len() > 0 and bool((values != 0).any())
+
+
 def _quality_unsupported_ids(source_dir: pathlib.Path) -> Dict[str, str]:
     metadata_path = pathlib.Path(source_dir).parent / "quality_cache" / (
         "ffbridge_quality_metadata.json"
@@ -830,14 +837,22 @@ def _process_club_session(
     lookup: pl.DataFrame,
     load_raw_session: Any,
     augment_raw_session: Any,
+    hrs_cache: Optional[List[Any]] = None,
+    cache_file_path: Optional[pathlib.Path] = None,
 ) -> Tuple[str, str, Optional[pl.DataFrame], Optional[str]]:
     board_path, hand_path = _fragment_paths(output_dir, session.session_id)
     if board_path.is_file() and hand_path.is_file():
-        return session.session_id, "resume", pl.read_parquet(board_path), None
+        boards = pl.read_parquet(board_path)
+        if _club_fragment_has_ev(boards):
+            return session.session_id, "resume", boards, None
     raw, _unmapped = load_raw_session(source_dir, session)
     if "Date" not in raw.columns and session.session_date:
         raw = raw.with_columns(pl.lit(session.session_date).alias("Date"))
-    augmented = augment_raw_session(raw)
+    augmented = augment_raw_session(
+        raw,
+        hrs_cache=hrs_cache,
+        cache_file_path=cache_file_path,
+    )
     del raw
     augmented = _overlay_session_lookup(augmented, lookup, session.session_id)
     boards, hands, _players, _clubs = build_from_frame(augmented)
@@ -866,6 +881,8 @@ def _try_write_from_quality_cache(
         from ffbridge_quality_pipeline import (  # type: ignore
             audit_historical_cache,
             augment_raw_session,
+            default_hrs_cache_path,
+            load_hrs_cache,
             load_raw_session,
         )
     except Exception as exc:
@@ -892,9 +909,11 @@ def _try_write_from_quality_cache(
         complete = complete[:limit]
     if workers < 1:
         raise ValueError("workers must be at least 1")
+    cache_file_path = default_hrs_cache_path(source_dir)
+    hrs_cache: List[Any] = [load_hrs_cache(cache_file_path)]
     print(
         f"[ffbridge-stats-builder] augmenting {len(complete)} cached sessions "
-        f"({workers} worker(s))",
+        f"({workers} worker(s)); SD cache {cache_file_path}",
         flush=True,
     )
     lookup = load_session_lookup(source_dir)
@@ -941,6 +960,8 @@ def _try_write_from_quality_cache(
                     lookup=lookup,
                     load_raw_session=load_raw_session,
                     augment_raw_session=augment_raw_session,
+                    hrs_cache=hrs_cache,
+                    cache_file_path=cache_file_path,
                 )
             except Exception as exc:
                 session_id, status, boards, error = (
@@ -963,6 +984,8 @@ def _try_write_from_quality_cache(
                     lookup=lookup,
                     load_raw_session=load_raw_session,
                     augment_raw_session=augment_raw_session,
+                    hrs_cache=hrs_cache,
+                    cache_file_path=cache_file_path,
                 ): session
                 for session in complete
             }
