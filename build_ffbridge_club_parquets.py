@@ -879,6 +879,7 @@ def _try_write_from_quality_cache(
         sys.path.insert(0, str(elo_dir))
     try:
         from ffbridge_quality_pipeline import (  # type: ignore
+            LancelotDDMismatchError,
             audit_historical_cache,
             augment_raw_session,
             default_hrs_cache_path,
@@ -963,6 +964,8 @@ def _try_write_from_quality_cache(
                     hrs_cache=hrs_cache,
                     cache_file_path=cache_file_path,
                 )
+            except LancelotDDMismatchError:
+                raise
             except Exception as exc:
                 session_id, status, boards, error = (
                     session.session_id,
@@ -997,6 +1000,8 @@ def _try_write_from_quality_cache(
                 done += 1
                 try:
                     session_id, status, boards, error = future.result()
+                except LancelotDDMismatchError:
+                    raise
                 except Exception as exc:
                     session_id, status, boards, error = (
                         session.session_id,
