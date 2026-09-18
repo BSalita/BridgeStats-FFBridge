@@ -41,6 +41,11 @@ HAND_FILENAME = "ffbridge_club_hand_records_augmented_narrow.parquet"
 PLAYER_FILENAME = "ffbridge_player_info.parquet"
 CLUB_FILENAME = "ffbridge_clubs.parquet"
 CLUB_FRAGMENT_DIRNAME = "club_session_fragments"
+# Cross-section Lancelot rows trip convert_ffdf_lancelot_to_mldf. One session
+# is not worth keeping the converter's same-section assert.
+DROPPED_SESSION_IDS = {
+    "124841": "cross-section home/away; omit from Club BridgeStats",
+}
 
 
 def _first_present(frame: pl.DataFrame, names: Sequence[str]) -> Optional[str]:
@@ -802,13 +807,17 @@ def _quality_unsupported_ids(source_dir: pathlib.Path) -> Dict[str, str]:
         "ffbridge_quality_metadata.json"
     )
     if not metadata_path.is_file():
-        return {}
+        return dict(DROPPED_SESSION_IDS)
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    return {
-        str(item["session_id"]): str(item.get("reason") or "unsupported by quality cache")
-        for item in payload.get("unsupported_sessions") or []
-        if item.get("session_id")
-    }
+    skipped = dict(DROPPED_SESSION_IDS)
+    skipped.update(
+        {
+            str(item["session_id"]): str(item.get("reason") or "unsupported by quality cache")
+            for item in payload.get("unsupported_sessions") or []
+            if item.get("session_id")
+        }
+    )
+    return skipped
 
 
 def _overlay_session_lookup(

@@ -74,6 +74,15 @@ class BuilderTests(unittest.TestCase):
             got = builder._quality_unsupported_ids(root / "data")
             self.assertEqual(got["38930"], "no PBN")
             self.assertEqual(got["38112"], "no contract")
+            self.assertIn("124841", got)
+
+    def test_dropped_session_is_skipped_without_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            got = builder._quality_unsupported_ids(Path(tmp) / "data")
+        self.assertEqual(
+            got["124841"],
+            "cross-section home/away; omit from Club BridgeStats",
+        )
 
     def test_from_quality_cache_skips_training_parquet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
