@@ -1021,6 +1021,76 @@ def _try_write_from_quality_cache(
     return write_outputs(output_dir, boards, hands, players, clubs)
 
 
+def repair_club_dd_from_ddss(
+    output_dir: pathlib.Path,
+    source_dir: pathlib.Path,
+    *,
+    dry_run: bool = False,
+) -> Dict[str, int]:
+    """Rewrite cached Lancelot DD with ddss, then patch Club fragments."""
+    elo_dir = pathlib.Path(__file__).resolve().parent.parent / "elo"
+    if str(elo_dir) not in sys.path:
+        sys.path.insert(0, str(elo_dir))
+    from ffbridge_quality_pipeline import (  # type: ignore
+        EMBEDDED_DD_COLUMNS,
+        _dd_tricks_expr,
+        default_hrs_cache_path,
+        load_hrs_cache,
+        repair_hrs_cache_dd_with_ddss,
+    )
+    from tqdm import tqdm
+
+    cache_path = default_hrs_cache_path(source_dir)
+    stats = repair_hrs_cache_dd_with_ddss(cache_path, dry_run=dry_run)
+    cache = load_hrs_cache(cache_path)
+    if cache is None or cache.is_empty():
+        return {**stats, "fragments_patched": 0}
+    slim = cache.select(["PBN", "ParScore", *EMBEDDED_DD_COLUMNS]).unique(
+        subset=["PBN"], maintain_order=True
+    )
+    fragment_root = pathlib.Path(output_dir) / CLUB_FRAGMENT_DIRNAME
+    board_paths = sorted(fragment_root.glob("*/boards.parquet"))
+    patched = 0
+    for board_path in tqdm(board_paths, desc="Patch Club DD fragments"):
+        boards = pl.read_parquet(board_path)
+        if "PBN" not in boards.columns:
+            continue
+        original_cols = boards.columns
+        joined = boards.drop(
+            [column for column in ("ParScore",) if column in boards.columns]
+        ).join(slim, on="PBN", how="left")
+        if "Declarer_Direction" in joined.columns and "BidSuit" in joined.columns:
+            joined = joined.with_columns(_dd_tricks_expr().alias("DD_Tricks"))
+        boards_out = joined.select(
+            [column for column in original_cols if column in joined.columns]
+        )
+        hand_path = board_path.with_name("hands.parquet")
+        if not hand_path.is_file():
+            continue
+        hands = pl.read_parquet(hand_path)
+        hand_cols = hands.columns
+        overlay_cols = ["PBN", "ParScore"] + [
+            column for column in EMBEDDED_DD_COLUMNS if column in hands.columns
+        ]
+        overlay = slim.select(
+            [column for column in overlay_cols if column in slim.columns]
+        )
+        drop = [column for column in overlay.columns if column != "PBN"]
+        hands_out = hands.drop(
+            [column for column in drop if column in hands.columns]
+        ).join(overlay, on="PBN", how="left")
+        hands_out = hands_out.select(
+            [column for column in hand_cols if column in hands_out.columns]
+        )
+        if not dry_run:
+            write_session_fragments(
+                output_dir, board_path.parent.name, boards_out, hands_out
+            )
+        patched += 1
+    stats["fragments_patched"] = patched
+    return stats
+
+
 def repair_outputs_from_metadata(
     output_dir: pathlib.Path,
     source_dir: pathlib.Path,
@@ -1128,6 +1198,16 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fill Date/Club on existing Club parquets from session metadata.",
     )
+    parser.add_argument(
+        "--repair-dd-from-ddss",
+        action="store_true",
+        help="Replace cached Lancelot DD with ddss and patch Club fragments.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --repair-dd-from-ddss, compare DD tables without writing.",
+    )
     return parser
 
 
@@ -1138,6 +1218,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"[ffbridge-stats-builder] start {started.isoformat(timespec='seconds')}", flush=True)
     output_dir = args.output_dir or resolve_data_path()
     try:
+        if args.repair_dd_from_ddss:
+            if not args.source_dir:
+                raise ValueError("--repair-dd-from-ddss requires --source-dir")
+            stats = repair_club_dd_from_ddss(
+                output_dir, args.source_dir, dry_run=args.dry_run
+            )
+            print(json.dumps({"output_dir": str(output_dir), "dd_repair": stats}, indent=2))
+            return 0
         if args.repair_from_metadata:
             if not args.source_dir:
                 raise ValueError("--repair-from-metadata requires --source-dir")
