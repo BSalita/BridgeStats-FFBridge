@@ -259,6 +259,127 @@ def apply_session_lookup(
     return boards, hands, players, clubs
 
 
+def _matchpoint_against_field(
+    frame: pl.DataFrame,
+    *,
+    value_col: str,
+    field_col: str,
+) -> pl.DataFrame:
+    """Matchpoint `value_col` against the board's actual `field_col` scores."""
+    if value_col not in frame.columns or field_col not in frame.columns:
+        return frame
+    unique_cols = ["session_id", "Board"]
+    missing = [column for column in unique_cols if column not in frame.columns]
+    if missing:
+        return frame
+    mp_col = f"MP_{value_col}"
+    pct_col = f"{value_col}_Pct"
+    drop_cols = [col for col in (mp_col, pct_col) if col in frame.columns]
+    if drop_cols:
+        frame = frame.drop(drop_cols)
+    field_scores = (
+        frame.select([*unique_cols, field_col])
+        .unique()
+        .group_by(unique_cols)
+        .agg(pl.col(field_col).alias("_field_scores"))
+    )
+    lookup = (
+        frame.select([*unique_cols, value_col])
+        .unique()
+        .join(field_scores, on=unique_cols, how="left")
+        .explode("_field_scores", empty_as_null=True)
+        .group_by([*unique_cols, value_col])
+        .agg(
+            (pl.col("_field_scores") < pl.col(value_col))
+            .sum()
+            .cast(pl.Float32)
+            .alias("beats"),
+            (pl.col("_field_scores") == pl.col(value_col))
+            .sum()
+            .cast(pl.Float32)
+            .alias("ties"),
+            pl.col("_field_scores").count().alias("total_comparisons"),
+        )
+        .with_columns(
+            (pl.col("beats") + pl.col("ties") * 0.5).alias(mp_col),
+            (
+                (pl.col("beats") + pl.col("ties") * 0.5)
+                / pl.when(pl.col("total_comparisons") >= 1)
+                .then(pl.col("total_comparisons"))
+                .otherwise(pl.lit(1))
+            )
+            .cast(pl.Float32)
+            .alias(pct_col),
+        )
+        .select([*unique_cols, value_col, mp_col, pct_col])
+    )
+    return frame.join(lookup, on=[*unique_cols, value_col], how="left")
+
+
+def _attach_mp_dd_pct_declarer(frame: pl.DataFrame) -> pl.DataFrame:
+    """Set MP_DD_Pct_Declarer to matchpoints for DD tricks at the table contract."""
+    if "DD_Score_Declarer" not in frame.columns:
+        return frame
+    if "Declarer_Direction" not in frame.columns and "Pair_Declarer_Direction" not in frame.columns:
+        return frame
+    work = frame
+    if "Pair_Declarer_Direction" not in work.columns:
+        work = work.with_columns(
+            pl.when(pl.col("Declarer_Direction").is_in(["N", "S"]))
+            .then(pl.lit("NS"))
+            .when(pl.col("Declarer_Direction").is_in(["E", "W"]))
+            .then(pl.lit("EW"))
+            .otherwise(None)
+            .alias("Pair_Declarer_Direction")
+        )
+    if "Score_NS" not in work.columns:
+        if "Score_Declarer" not in work.columns:
+            return frame
+        work = work.with_columns(
+            pl.when(pl.col("Pair_Declarer_Direction") == "NS")
+            .then(pl.col("Score_Declarer"))
+            .when(pl.col("Pair_Declarer_Direction") == "EW")
+            .then(-pl.col("Score_Declarer"))
+            .otherwise(None)
+            .alias("Score_NS")
+        )
+    if "Score_EW" not in work.columns and "Score_NS" in work.columns:
+        work = work.with_columns((-pl.col("Score_NS")).alias("Score_EW"))
+    work = work.with_columns(
+        pl.when(pl.col("Pair_Declarer_Direction") == "NS")
+        .then(pl.col("DD_Score_Declarer"))
+        .when(pl.col("Pair_Declarer_Direction") == "EW")
+        .then(-pl.col("DD_Score_Declarer"))
+        .otherwise(None)
+        .alias("_DD_Score_NS"),
+        pl.when(pl.col("Pair_Declarer_Direction") == "EW")
+        .then(pl.col("DD_Score_Declarer"))
+        .when(pl.col("Pair_Declarer_Direction") == "NS")
+        .then(-pl.col("DD_Score_Declarer"))
+        .otherwise(None)
+        .alias("_DD_Score_EW"),
+    )
+    if work["_DD_Score_NS"].drop_nulls().is_empty():
+        return frame
+    work = _matchpoint_against_field(
+        work, value_col="_DD_Score_NS", field_col="Score_NS"
+    )
+    work = _matchpoint_against_field(
+        work, value_col="_DD_Score_EW", field_col="Score_EW"
+    )
+    if "_DD_Score_NS_Pct" not in work.columns:
+        return frame
+    return work.with_columns(
+        pl.when(pl.col("Pair_Declarer_Direction") == "NS")
+        .then(pl.col("_DD_Score_NS_Pct"))
+        .when(pl.col("Pair_Declarer_Direction") == "EW")
+        .then(pl.col("_DD_Score_EW_Pct"))
+        .otherwise(None)
+        .cast(pl.Float64)
+        .alias("MP_DD_Pct_Declarer")
+    )
+
+
 def _seat_player_expr(direction_col: str, prefix: str) -> pl.Expr:
     expr = pl.lit(None, dtype=pl.Utf8)
     for seat in SEATS:
@@ -448,6 +569,8 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
             .otherwise(pl.col("HandRecordBoard").cast(pl.Utf8))
             .alias("HandRecordBoard")
         )
+
+    out = _attach_mp_dd_pct_declarer(out)
 
     selected = []
     for col in BOARD_RESULT_COLUMNS:

@@ -97,6 +97,27 @@ class BuilderTests(unittest.TestCase):
                     from_quality_cache=True,
                 )
 
+    def test_map_board_results_computes_mp_dd_from_contract_dd_score(self) -> None:
+        raw = pl.DataFrame(
+            {
+                "session_id": ["99", "99", "99"],
+                "Date": ["2024-03-01", "2024-03-01", "2024-03-01"],
+                "Declarer_Direction": ["N", "S", "E"],
+                "Player_ID_N": ["1", "1", "1"],
+                "Player_ID_E": ["2", "2", "2"],
+                "Player_ID_S": ["3", "3", "3"],
+                "Player_ID_W": ["4", "4", "4"],
+                "Board": [1, 1, 1],
+                "Score_Declarer": [420, 170, 50],
+                "DD_Score_Declarer": [420, 170, 50],
+                "PBN": ["N:AK...", "N:AK...", "N:AK..."],
+            }
+        )
+        out = builder.map_board_results(raw)
+        self.assertAlmostEqual(out["MP_DD_Pct_Declarer"][0], 2.5 / 3, places=5)
+        self.assertAlmostEqual(out["MP_DD_Pct_Declarer"][1], 1.5 / 3, places=5)
+        self.assertAlmostEqual(out["MP_DD_Pct_Declarer"][2], 2.5 / 3, places=5)
+
     def test_map_board_results_parses_datetime_dates(self) -> None:
         raw = pl.DataFrame(
             {
