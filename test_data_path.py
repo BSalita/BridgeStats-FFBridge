@@ -12,6 +12,7 @@ class DataPathTests(unittest.TestCase):
     def setUp(self) -> None:
         self._previous = os.environ.pop(bridgestatslib.DATA_DIR_ENV, None)
         self._alias = os.environ.pop("BRIDGESTATS_DATA_DIR", None)
+        self._data_root = os.environ.pop("DATA_ROOT", None)
 
     def tearDown(self) -> None:
         if self._previous is None:
@@ -22,6 +23,10 @@ class DataPathTests(unittest.TestCase):
             os.environ.pop("BRIDGESTATS_DATA_DIR", None)
         else:
             os.environ["BRIDGESTATS_DATA_DIR"] = self._alias
+        if self._data_root is None:
+            os.environ.pop("DATA_ROOT", None)
+        else:
+            os.environ["DATA_ROOT"] = self._data_root
 
     def test_default_is_repo_data_dir(self) -> None:
         expected = pathlib.Path(bridgestatslib.__file__).resolve().parent / "data"

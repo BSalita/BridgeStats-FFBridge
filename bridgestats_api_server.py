@@ -7,12 +7,14 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import duckdb
+import polars as pl
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
+import bridge_api_common as api_common
 import bridgestatslib as service
 
-API_BUILD_TAG = "2026-09-09-history-join"
+API_BUILD_TAG = "2026-09-20-result-strings"
 app = FastAPI(title="FFBridge BridgeStats API", version="1.0.0")
 
 
@@ -21,6 +23,19 @@ class SqlRequest(BaseModel):
     source: str = "club_board_results"
     limit: int = 500
     tables: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    meta: Optional[Dict[str, Any]] = None
+
+
+class FavoriteRunRequest(BaseModel):
+    source: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+    limit: int = 500
+    club_or_tournament: Optional[str] = None
+    clubs: List[str] = Field(default_factory=list)
+    players: List[str] = Field(default_factory=list)
+    pairs: List[str] = Field(default_factory=list)
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
 
 
 class BoardResultsRequest(BaseModel):
@@ -65,20 +80,20 @@ class HandRecordsRequest(BaseModel):
 def _run(callable_, /, *args, **kwargs):
     try:
         return callable_(*args, **kwargs)
-    except (duckdb.Error, FileNotFoundError, KeyError, ValueError) as exc:
+    except (duckdb.Error, FileNotFoundError, KeyError, ValueError, pl.exceptions.ComputeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/health")
 def health() -> dict:
     info = _run(service.dataset_info)
-    return {
-        **info,
-        "status": "ok",
-        "service": "ffbridge-stats-api",
-        "api_version": app.version,
-        "build_tag": API_BUILD_TAG,
-    }
+    return api_common.health_payload(
+        info,
+        service="ffbridge-stats-api",
+        api_version=app.version,
+        build_tag=API_BUILD_TAG,
+        info_first=True,
+    )
 
 
 @app.get("/ffbridge-stats/dataset-info")
@@ -103,6 +118,53 @@ def sql(request: SqlRequest) -> dict:
         request.source,
         request.limit,
         extra_tables=request.tables,
+        meta=request.meta,
+    )
+
+
+@app.get("/ffbridge-stats/favorites")
+def favorites(id: Optional[str] = Query(None)) -> dict:
+    return _run(service.list_favorites, id)
+
+
+@app.post("/ffbridge-stats/favorites/{favorite_id}")
+def run_favorite(favorite_id: str, request: FavoriteRunRequest) -> dict:
+    meta = dict(request.meta or {})
+    built = service.build_report_meta(
+        clubs=request.clubs,
+        players=request.players,
+        pairs=request.pairs,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        club_or_tournament=request.club_or_tournament or "club",
+        pair_direction=meta.get("pair_direction"),
+        opponent_pair_direction=meta.get("opponent_pair_direction"),
+        player_direction=meta.get("player_direction"),
+        partner_direction=meta.get("partner_direction"),
+        sort_column=str(meta.get("Sort_Column") or "Declarer_Pct"),
+        min_declares=int(meta.get("Min_Declares") or 0),
+        top_n=int(meta.get("Top_N") or request.limit),
+    )
+    built.update(meta)
+    frame = None
+    if request.club_or_tournament or request.clubs or request.players or request.pairs:
+        _source, _any_position, selected = _run(
+            service._prepare_board_frames,
+            request.club_or_tournament or "club",
+            request.clubs,
+            request.players,
+            request.pairs,
+            request.start_date,
+            request.end_date,
+        )
+        frame = selected
+    return _run(
+        service.run_favorite,
+        favorite_id,
+        built,
+        frame,
+        request.source,
+        request.limit,
     )
 
 
