@@ -526,6 +526,18 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
             out = out.with_columns(pl.col(src).alias(dest))
         else:
             out = out.with_columns(pl.lit(default).alias(dest))
+    if "Result" in out.columns:
+        out = out.with_columns(
+            pl.col("Result").cast(pl.Utf8).str.strip_chars().alias("Result")
+        )
+        out = out.with_columns(
+            pl.when(pl.col("Result").is_in(["", "=", "0", "+0", "-0"]))
+            .then(pl.lit(0, dtype=pl.Int32))
+            .otherwise(
+                pl.col("Result").str.replace(r"^\+", "").cast(pl.Int32, strict=False)
+            )
+            .alias("Result")
+        )
 
     out = _with_dealer(out)
 

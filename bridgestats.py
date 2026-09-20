@@ -3,6 +3,7 @@
 # 2. Output chart label with names instead of Declarer_Pairs
 # 3. Due to rendering delays, limit charts to the 100 most frequent x labels.
 
+import datetime
 import pathlib
 import re
 import sys
@@ -136,9 +137,9 @@ def Stats(club_or_tournament, pair_or_player, chart_options, groupby):
     )
     start_date = st.sidebar.text_input(
         "Enter start date:",
-        value="2019-01-01",
-        key=key_prefix + "-Start_Date",
-        help="Enter starting date in YYYY-MM-DD format. Earliest year is 2019",
+        value=(datetime.date.today() - datetime.timedelta(days=30)).isoformat(),
+        key=key_prefix + "-Start_Date-v2",
+        help="YYYY-MM-DD. Default is the last 30 days. A wide range with no club or player filter can exceed the row limit.",
     )
     end_date = st.sidebar.text_input(
         "Enter end date:",

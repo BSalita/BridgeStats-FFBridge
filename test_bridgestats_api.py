@@ -273,6 +273,17 @@ class BridgeStatsApiTests(unittest.TestCase):
         self.assertEqual(filtered.status_code, 200, filtered.text)
         self.assertGreaterEqual(filtered.json()["selected_count"], 1)
 
+    def test_favorites_list_returns_unexpanded_sql(self) -> None:
+        listed = self.client.get(
+            "/ffbridge-stats/favorites", params={"id": "Declarer_Leaderboard"}
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        body = listed.json()
+        self.assertEqual(body["count"], 1)
+        sql = body["favorites"][0]["statements"][0]["sql"]
+        self.assertIn("{Sort_Column}", sql)
+        self.assertIn("{Pair_Filter}", sql)
+
 
 if __name__ == "__main__":
     unittest.main()
