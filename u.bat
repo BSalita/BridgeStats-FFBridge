@@ -6,7 +6,10 @@ rem an E: monolith, drop it from this list and mount extra-data instead.
 
 set "ffbridge_source=e:\bridge\data\ffbridge"
 set "ffbridge_source_data=e:\bridge\data\ffbridge\data"
-set "elo_index=%~dp0..\elo\data\ffbridge\player_session_index"
+set "elo_index=%~dp0..\data\ffbridge\player_session_index"
+if not exist "%elo_index%\lancelot_persons.parquet" (
+    set "elo_index=%~dp0..\elo\data\ffbridge\player_session_index"
+)
 set "prod_bridgestats=\\X1-pro-470-1tb\c\sw\bridge\ML-Contract-Bridge\src\bridgestats-ffbridge\data"
 rem Do not treat C:\sw\bridge\...\data as prod: that path is also the OneDrive
 rem junction on the data host (P620). Detect the prod box by computer name.
