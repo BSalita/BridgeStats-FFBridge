@@ -1320,6 +1320,22 @@ def dataset_info() -> Dict[str, Any]:
         "search_roots": [str(root) for root in data_search_roots()],
         "sources": sources,
         "sql_tables": list(SOURCE_FILES),
+        "recent_club_games": _recent_club_games_info(),
+    }
+
+
+def _recent_club_games_info() -> Dict[str, Any]:
+    path = pathlib.Path(
+        r"e:/bridge/data/ffbridge/recent/ffbridge_boards_recent.parquet"
+    )
+    return {
+        "sql_view": "recent_club_games",
+        "available": path.is_file(),
+        "path": str(path) if path.is_file() else None,
+        "note": (
+            "Board scores newer than the quality parquet. Registered on SQL "
+            "connections beside self. Ratings stay on the historical tables."
+        ),
     }
 
 
@@ -1382,6 +1398,15 @@ def run_sql(
             con.execute(f"CREATE VIEW {CON_REGISTER_NAME} AS SELECT * FROM {source}")
         for name, rows in extras.items():
             con.register(name, pl.DataFrame(rows))
+        recent_games = pathlib.Path(
+            r"e:/bridge/data/ffbridge/recent/ffbridge_boards_recent.parquet"
+        )
+        if recent_games.is_file():
+            recent_sql = str(recent_games).replace("'", "''")
+            con.execute(
+                "CREATE OR REPLACE VIEW recent_club_games AS "
+                f"SELECT * FROM read_parquet('{recent_sql}')"
+            )
 
     result, truncated = api_common.truncate_frame(
         api_common.run_duckdb_sql(sql, _setup), limit
