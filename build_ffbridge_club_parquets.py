@@ -433,6 +433,14 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
         )
     else:
         out = out.with_columns(pl.col("Declarer").cast(pl.Utf8))
+        stored = pl.col("Declarer")
+        compass = stored.is_null() | stored.is_in(["N", "E", "S", "W", "O", "-", ""])
+        out = out.with_columns(
+            pl.when(compass)
+            .then(_seat_player_expr("Declarer_Direction", "Player_ID_"))
+            .otherwise(stored)
+            .alias("Declarer")
+        )
 
     if "Dummy" not in out.columns:
         dummy = pl.lit(None, dtype=pl.Utf8)

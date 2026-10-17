@@ -89,8 +89,8 @@ BOARD_RESULT_COLUMNS = (
 BOARD_RESULT_OPTIONAL_COLUMNS = (
     "Club",
     "Declarer",
-    # TODO: Remove Dealer from optional columns and remove its virtual-column
-    # support after the next published parquet rebuild persists Dealer.
+    # Current club parquets store Dealer. Keep it optional so an older file
+    # still loads; the SQL view fabricates the column when it is absent.
     "Dealer",
     "Player_Name_N",
     "Player_Name_E",
@@ -239,6 +239,33 @@ FABRICATED_DEALER_SQL = (
     "WHEN 3 THEN 'W' "
     "END"
 )
+# Rebuilt club files store a compass letter in Declarer. SQL and reports
+# expose the seat's player id instead. A stored player id is left as-is.
+DECLARER_PLAYER_SQL = (
+    "CASE WHEN CAST(Declarer AS VARCHAR) IN ('N', 'E', 'S', 'W', 'O', '-', '') "
+    "OR Declarer IS NULL THEN CASE REPLACE(CAST(Declarer_Direction AS VARCHAR), 'O', 'W') "
+    "WHEN 'N' THEN CAST(Player_ID_N AS VARCHAR) "
+    "WHEN 'E' THEN CAST(Player_ID_E AS VARCHAR) "
+    "WHEN 'S' THEN CAST(Player_ID_S AS VARCHAR) "
+    "WHEN 'W' THEN CAST(Player_ID_W AS VARCHAR) "
+    "ELSE CAST(Declarer AS VARCHAR) END "
+    "ELSE CAST(Declarer AS VARCHAR) END"
+)
+# Rebuilt club files store overtricks as +2, =, -1. SQL exposes an integer.
+RESULT_OVERTRICK_SQL = (
+    "CASE WHEN Result IS NULL OR TRIM(CAST(Result AS VARCHAR)) "
+    "IN ('', '=', '0', '+0', '-0', '-') THEN 0 "
+    "ELSE TRY_CAST(REPLACE(TRIM(CAST(Result AS VARCHAR)), '+', '') AS INTEGER) END"
+)
+_DECLARER_COMPASS_VALUES = ("N", "E", "S", "W", "O", "-", "")
+_DECLARER_PLAYER_COLUMNS = (
+    "Declarer",
+    "Declarer_Direction",
+    "Player_ID_N",
+    "Player_ID_E",
+    "Player_ID_S",
+    "Player_ID_W",
+)
 
 
 def sql_requests_contract(sql: str) -> bool:
@@ -316,6 +343,10 @@ def inject_fabricated_columns(source: str, columns: List[Any]) -> List[Any]:
     return inject_fabricated_dealer_columns(source, columns)
 
 
+def declarer_column_needs_player_id(column_names: Iterable[str]) -> bool:
+    return set(_DECLARER_PLAYER_COLUMNS).issubset(set(column_names))
+
+
 def board_results_view_sql(
     escaped_path: str,
     column_names: Iterable[str],
@@ -324,6 +355,11 @@ def board_results_view_sql(
     include_dealer: bool,
 ) -> str:
     names = set(column_names)
+    replacements = []
+    if declarer_column_needs_player_id(names):
+        replacements.append(f"{DECLARER_PLAYER_SQL} AS Declarer")
+    if "Result" in names:
+        replacements.append(f"{RESULT_OVERTRICK_SQL} AS Result")
     additions = []
     if include_contract and "Contract" not in names:
         missing = [name for name in CONTRACT_PIECE_COLUMNS if name not in names]
@@ -337,11 +373,13 @@ def board_results_view_sql(
         if "Board" not in names:
             raise ValueError("Dealer is not stored and cannot be fabricated; missing Board")
         additions.append(f"{FABRICATED_DEALER_SQL} AS Dealer")
+    select = "src.*"
+    if replacements:
+        select += " REPLACE (" + ", ".join(replacements) + ")"
     if additions:
-        return (
-            f"SELECT src.*, {', '.join(additions)} "
-            f"FROM read_parquet('{escaped_path}') AS src"
-        )
+        select += ", " + ", ".join(additions)
+    if replacements or additions:
+        return f"SELECT {select} FROM read_parquet('{escaped_path}') AS src"
     return f"SELECT * FROM read_parquet('{escaped_path}')"
 
 
@@ -511,8 +549,34 @@ def _select_columns(schema, wanted, optional=()):
     return [col for col in wanted if col in schema]
 
 
+def rewrite_stored_declarer(df: pl.DataFrame) -> pl.DataFrame:
+    """Replace a compass letter in Declarer with that seat's player id."""
+    if not declarer_column_needs_player_id(df.columns):
+        return df
+    direction = (
+        pl.col("Declarer_Direction").cast(pl.Utf8).str.replace("O", "W", literal=True)
+    )
+    seat_player = pl.lit(None, dtype=pl.Utf8)
+    for seat in ("N", "E", "S", "W"):
+        seat_player = (
+            pl.when(direction == seat)
+            .then(pl.col(f"Player_ID_{seat}").cast(pl.Utf8))
+            .otherwise(seat_player)
+        )
+    stored = pl.col("Declarer").cast(pl.Utf8)
+    return df.with_columns(
+        pl.when(stored.is_null() | stored.is_in(list(_DECLARER_COMPASS_VALUES)))
+        .then(seat_player)
+        .otherwise(stored)
+        .alias("Declarer")
+    )
+
+
 def normalize_board_results(df):
     """Compute pair keys and diffs from current pipeline columns only."""
+    df = rewrite_stored_declarer(df)
+    if "Result" in df.columns:
+        df = df.with_columns(result_overtrick_count().alias("Result"))
     if "Declarer" not in df.columns:
         needed = {
             "Declarer_Direction",
@@ -728,7 +792,7 @@ def build_report_meta(
     partner_direction: Optional[str] = None,
 ) -> Dict[str, Any]:
     sort_column = validate_sort_column(sort_column)
-    player_ids = [str(player) for player in players]
+    player_ids = expand_ffbridge_player_numbers([str(player) for player in players])
     club_ids = [str(club) for club in clubs]
     pair_ids = [str(pair) for pair in pairs]
     player_list_sql = sql_literal_list(player_ids) if player_ids else ""
@@ -856,21 +920,27 @@ def execute_sql_on_frame(
     source: str = CON_REGISTER_NAME,
 ) -> Dict[str, Any]:
     sql, limit = api_common.prepare_sql(expand_sql(sql, meta), source, limit)
+    replacements = []
+    if declarer_column_needs_player_id(df.columns):
+        replacements.append(f"{DECLARER_PLAYER_SQL} AS Declarer")
+    if "Result" in df.columns:
+        replacements.append(f"{RESULT_OVERTRICK_SQL} AS Result")
     additions = []
     if sql_requests_contract(sql) and can_fabricate_contract(df.columns):
         additions.append(f"{FABRICATED_CONTRACT_SQL} AS Contract")
     if sql_requests_dealer(sql) and can_fabricate_dealer(df.columns):
         additions.append(f"{FABRICATED_DEALER_SQL} AS Dealer")
+    select = "_fav_src.*"
+    if replacements:
+        select += " REPLACE (" + ", ".join(replacements) + ")"
+    if additions:
+        select += ", " + ", ".join(additions)
 
     def _setup(con) -> None:
         con.register("_fav_src", df)
-        if additions:
-            con.execute(
-                f"CREATE VIEW {CON_REGISTER_NAME} AS "
-                f"SELECT _fav_src.*, {', '.join(additions)} FROM _fav_src"
-            )
-        else:
-            con.execute(f"CREATE VIEW {CON_REGISTER_NAME} AS SELECT * FROM _fav_src")
+        con.execute(
+            f"CREATE VIEW {CON_REGISTER_NAME} AS SELECT {select} FROM _fav_src"
+        )
         if source != CON_REGISTER_NAME:
             con.execute(f"CREATE VIEW {source} AS SELECT * FROM {CON_REGISTER_NAME}")
 
@@ -1348,6 +1418,10 @@ def schema_columns(
         source,
         [{"name": name, "dtype": str(dtype)} for name, dtype in schema.items()],
     )
+    if source == "club_board_results":
+        for item in items:
+            if item.get("name") == "Result":
+                item["dtype"] = "Int32"
     if pattern:
         regex = re.compile(pattern, re.IGNORECASE)
         items = [item for item in items if regex.search(item["name"])]

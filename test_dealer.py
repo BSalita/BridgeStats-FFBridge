@@ -45,6 +45,32 @@ class DealerColumnTests(unittest.TestCase):
             ["N", "E", "S", "W", "N"],
         )
 
+    def test_run_sql_rewrites_compass_declarer_and_result_text(self) -> None:
+        boards = pl.DataFrame(
+            {
+                "session_id": ["s1", "s1"],
+                "Board": [1, 2],
+                "Dealer": ["N", "E"],
+                "Declarer": ["N", "246273"],
+                "Declarer_Direction": ["N", "S"],
+                "Player_ID_N": ["111", "111"],
+                "Player_ID_E": ["222", "222"],
+                "Player_ID_S": ["333", "333"],
+                "Player_ID_W": ["444", "444"],
+                "Result": ["+2", "="],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "boards.parquet"
+            boards.write_parquet(path)
+            with patch.object(lib, "resolve_source_path", return_value=path):
+                payload = lib.run_sql(
+                    "SELECT Declarer, Result FROM self ORDER BY Board",
+                    "club_board_results",
+                )
+        self.assertEqual([row["Declarer"] for row in payload["rows"]], ["111", "246273"])
+        self.assertEqual([row["Result"] for row in payload["rows"]], [2, 0])
+
     def test_builder_persists_and_normalizes_dealer(self) -> None:
         raw = pl.DataFrame(
             {

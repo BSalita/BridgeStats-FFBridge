@@ -118,6 +118,23 @@ class BuilderTests(unittest.TestCase):
         self.assertAlmostEqual(out["MP_DD_Pct_Declarer"][1], 1.5 / 3, places=5)
         self.assertAlmostEqual(out["MP_DD_Pct_Declarer"][2], 2.5 / 3, places=5)
 
+    def test_map_board_results_replaces_compass_declarer(self) -> None:
+        raw = pl.DataFrame(
+            {
+                "session_id": ["99"],
+                "Declarer": ["N"],
+                "Declarer_Direction": ["N"],
+                "Player_ID_N": ["111"],
+                "Player_ID_E": ["222"],
+                "Player_ID_S": ["333"],
+                "Player_ID_W": ["444"],
+                "Board": [1],
+                "PBN": ["N:AK..."],
+            }
+        )
+        out = builder.map_board_results(raw)
+        self.assertEqual(out["Declarer"].to_list(), ["111"])
+
     def test_map_board_results_parses_datetime_dates(self) -> None:
         raw = pl.DataFrame(
             {

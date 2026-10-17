@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 import bridge_api_common as api_common
 import bridgestatslib as service
 
-API_BUILD_TAG = "2026-09-20-result-strings"
+API_BUILD_TAG = "2026-10-17-declarer-player-result-overtricks"
 app = FastAPI(title="FFBridge BridgeStats API", version="1.0.0")
 
 
@@ -112,6 +112,12 @@ def schema(
 
 @app.post("/ffbridge-stats/sql")
 def sql(request: SqlRequest) -> dict:
+    """DuckDB over one club table registered as self.
+
+    Declarer is the declarer's player id. A stored compass letter is replaced
+    with Player_ID_N/E/S/W. Result is overtricks as an integer. numbers in
+    meta player filters accept a license, Lancelot person id, or Classic id.
+    """
     return _run(
         service.run_sql,
         request.sql,
@@ -175,6 +181,10 @@ def players_lookup(
     names: Optional[str] = Query(None),
     limit: int = Query(500, ge=1, le=2000),
 ) -> dict:
+    """Lookup players. `numbers` may be a license, Lancelot id, or Classic id.
+
+    The returned player_id is the Classic id stored in Player_ID_N/E/S/W.
+    """
     return _run(
         service.player_lookup,
         clubs=clubs,

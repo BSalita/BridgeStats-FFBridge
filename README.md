@@ -36,9 +36,16 @@ Expected files:
 - `ffbridge_player_info.parquet`
 - `ffbridge_clubs.parquet`
 
-`club_board_results` exposes `Dealer` as a normal SQL/schema column. Until the
-next full parquet rebuild persists it, the API supplies `Dealer` virtually from
-the standard duplicate-board rotation. Remove that compatibility layer after
-the rebuilt parquet is published.
+`club_board_results.Dealer` is stored on the current parquet. Older files
+still receive that column from the standard duplicate-board rotation.
+
+`Declarer` in SQL and reports is the declarer's player id. A rebuilt file may
+store N/E/S/W in that column; the API replaces it from `Player_ID_*`.
+`Declarer_Direction` stays the compass. `Result` is overtricks as an integer
+(`+2`, `=`, and `-1` in the file). Compare `Score_Declarer` with `ParScore`.
+
+Player `numbers` accept a license, a Lancelot person id, or a Classic id.
+`data/lancelot_persons.parquet` supplies the aliases. Seat columns and the
+lookup `player_id` are the Classic id.
 
 Search roots: `BRIDGESTATS_FFBRIDGE_DATA_DIR`, `data/`, `E:\bridge\data\ffbridge`.

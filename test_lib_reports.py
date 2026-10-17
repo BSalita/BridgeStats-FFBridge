@@ -224,6 +224,7 @@ class ReportLibTests(unittest.TestCase):
                 by_classic = lib.filter_players_by_number(
                     catalog, "597539", "player_id"
                 )
+                meta = lib.build_report_meta(players=["9500754"])
             finally:
                 lib.reset_person_alias_cache()
                 if previous is None:
@@ -233,6 +234,8 @@ class ReportLibTests(unittest.TestCase):
         self.assertEqual(by_license["player_id"].to_list(), ["597539"])
         self.assertEqual(by_lancelot["player_id"].to_list(), ["597539"])
         self.assertEqual(by_classic["player_id"].to_list(), ["597539"])
+        self.assertIn("'597539'", meta["Players"])
+        self.assertIn("'9500754'", meta["Player_Filter"])
         ranked = lib.filter_players_by_name(
             pl.DataFrame(
                 {
