@@ -139,22 +139,30 @@ def _parse_session_club(payload: Mapping[str, Any]) -> tuple[Optional[str], Opti
 def load_session_lookup(source_dir: pathlib.Path) -> pl.DataFrame:
     """session_id -> Date / Club / club_name from Lancelot session metadata."""
     sessions_dir = pathlib.Path(source_dir) / "competitions" / "sessions"
-    rows: List[Dict[str, Any]] = []
+    payloads: List[Tuple[str, Mapping[str, Any]]] = []
     if sessions_dir.is_dir():
         for path in sessions_dir.glob("*.json"):
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                continue
-            session_id = str(payload.get("id") or path.stem)
-            club, name = _parse_session_club(payload)
-            rows.append(
-                {
-                    "session_id": session_id,
-                    "Date": _parse_session_date(payload),
-                    "Club": club,
-                    "club_name": name,
-                }
-            )
+            if isinstance(payload, dict):
+                payloads.append((path.stem, payload))
+    return session_lookup_from_payloads(payloads)
+
+
+def session_lookup_from_payloads(
+    payloads: Iterable[Tuple[str, Mapping[str, Any]]],
+) -> pl.DataFrame:
+    """Session lookup from (file stem, session metadata payload) pairs."""
+    rows: List[Dict[str, Any]] = []
+    for stem, payload in payloads:
+        club, name = _parse_session_club(payload)
+        rows.append(
+            {
+                "session_id": str(payload.get("id") or stem),
+                "Date": _parse_session_date(payload),
+                "Club": club,
+                "club_name": name,
+            }
+        )
     if not rows:
         return pl.DataFrame(
             {
@@ -852,37 +860,6 @@ def write_session_fragments(
     return board_path, hand_path
 
 
-def _extend_unique(
-    acc: List[pl.DataFrame],
-    frame: pl.DataFrame,
-    subset: str,
-    *,
-    flush_at: int = 32,
-) -> List[pl.DataFrame]:
-    if frame.height == 0:
-        return acc
-    acc.append(frame)
-    if len(acc) < flush_at:
-        return acc
-    return [
-        pl.concat(acc, how="vertical_relaxed").unique(
-            subset=[subset], maintain_order=True
-        )
-    ]
-
-
-def _finalize_unique(
-    acc: List[pl.DataFrame],
-    subset: str,
-    empty: pl.DataFrame,
-) -> pl.DataFrame:
-    if not acc:
-        return empty
-    return pl.concat(acc, how="vertical_relaxed").unique(
-        subset=[subset], maintain_order=True
-    )
-
-
 def _concat_parquet_paths(paths: Sequence[pathlib.Path]) -> Optional[pl.DataFrame]:
     existing = [path for path in paths if path.is_file()]
     if not existing:
@@ -981,6 +958,53 @@ def _overlay_session_lookup(
     return frame.with_columns(*overlays)
 
 
+def write_club_fragments_from_augmented(
+    output_dir: pathlib.Path,
+    session: Any,
+    augmented: pl.DataFrame,
+    lookup: pl.DataFrame,
+) -> None:
+    """Club boards/hands fragments for one augmented quality-pipeline session."""
+    if "Date" not in augmented.columns and session.session_date:
+        augmented = augmented.with_columns(pl.lit(session.session_date).alias("Date"))
+    augmented = _overlay_session_lookup(augmented, lookup, session.session_id)
+    boards, hands, _players, _clubs = build_from_frame(augmented)
+    write_session_fragments(output_dir, session.session_id, boards, hands)
+
+
+class ClubFragmentWriter:
+    """Quality-pipeline session hook: write Club fragments from the augmented frame.
+
+    Picklable, so quality worker processes can run it.
+    """
+
+    def __init__(self, output_dir: pathlib.Path, lookup: pl.DataFrame) -> None:
+        self.output_dir = pathlib.Path(output_dir)
+        self.lookup = lookup
+
+    def __call__(self, session: Any, augmented: pl.DataFrame) -> None:
+        if session.session_id in DROPPED_SESSION_IDS:
+            return
+        try:
+            write_club_fragments_from_augmented(
+                self.output_dir, session, augmented, self.lookup
+            )
+        except Exception as exc:
+            print(
+                f"[ffbridge-stats-builder] Club fragment failed for session "
+                f"{session.session_id}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+
+def _club_fragment_is_current(board_path: pathlib.Path, hand_path: pathlib.Path) -> bool:
+    if not (board_path.is_file() and hand_path.is_file()):
+        return False
+    if "EV_Score_Declarer" not in pl.read_parquet_schema(board_path):
+        return False
+    return _club_fragment_has_ev(pl.read_parquet(board_path, columns=["EV_Score_Declarer"]))
+
+
 def _process_club_session(
     session: Any,
     *,
@@ -991,12 +1015,10 @@ def _process_club_session(
     augment_raw_session: Any,
     hrs_cache: Optional[List[Any]] = None,
     cache_file_path: Optional[pathlib.Path] = None,
-) -> Tuple[str, str, Optional[pl.DataFrame], Optional[str]]:
+) -> Tuple[str, str, Optional[str]]:
     board_path, hand_path = _fragment_paths(output_dir, session.session_id)
-    if board_path.is_file() and hand_path.is_file():
-        boards = pl.read_parquet(board_path)
-        if _club_fragment_has_ev(boards):
-            return session.session_id, "resume", boards, None
+    if _club_fragment_is_current(board_path, hand_path):
+        return session.session_id, "resume", None
     raw, _unmapped = load_raw_session(source_dir, session)
     if "Date" not in raw.columns and session.session_date:
         raw = raw.with_columns(pl.lit(session.session_date).alias("Date"))
@@ -1006,11 +1028,32 @@ def _process_club_session(
         cache_file_path=cache_file_path,
     )
     del raw
-    augmented = _overlay_session_lookup(augmented, lookup, session.session_id)
-    boards, hands, _players, _clubs = build_from_frame(augmented)
-    del augmented
-    write_session_fragments(output_dir, session.session_id, boards, hands)
-    return session.session_id, "augment", boards, None
+    write_club_fragments_from_augmented(output_dir, session, augmented, lookup)
+    return session.session_id, "augment", None
+
+
+CLUB_MANIFEST_FILENAME = "ffbridge_club_manifest.json"
+
+
+def _club_outputs_are_current(
+    output_dir: pathlib.Path, candidate_ids: Sequence[str]
+) -> Tuple[bool, str]:
+    """Outputs are current when built from these candidates and no kept fragment changed since."""
+    manifest_path = output_dir / CLUB_MANIFEST_FILENAME
+    board_output = output_dir / BOARD_FILENAME
+    if not manifest_path.is_file() or not board_output.is_file():
+        return False, "manifest or board output missing"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest["candidates"] != list(candidate_ids):
+        return False, "candidate sessions changed"
+    built_at = board_output.stat().st_mtime
+    for session_id in manifest["kept"]:
+        for path in _fragment_paths(output_dir, session_id):
+            if not path.is_file():
+                return False, f"fragment missing for session {session_id}"
+            if path.stat().st_mtime > built_at:
+                return False, f"fragment newer than outputs for session {session_id}"
+    return True, f"{len(manifest['kept'])} session fragments unchanged since last build"
 
 
 def _try_write_from_quality_cache(
@@ -1018,13 +1061,16 @@ def _try_write_from_quality_cache(
     output_dir: pathlib.Path,
     limit: Optional[int],
     workers: int = 8,
+    if_stale: bool = False,
 ) -> Optional[Dict[str, str]]:
     """Augment one session at a time and persist slim Club fragments.
 
     Holding every mlBridge frame until a final concat OOMs on the full
-    historical cache. Fragments also let a rerun resume after a crash.
+    historical cache. Fragments also let a rerun resume after a crash;
+    the quality builder writes most of them already (ClubFragmentWriter).
     Sessions already marked unusable by the quality cache are skipped
-    without reloading their team JSON.
+    without reloading their team JSON. With ``if_stale``, nothing is
+    rewritten when the candidates and their fragments are unchanged.
     """
     elo_dir = pathlib.Path(__file__).resolve().parent.parent / "elo"
     if str(elo_dir) not in sys.path:
@@ -1033,6 +1079,7 @@ def _try_write_from_quality_cache(
         from ffbridge_quality_pipeline import (  # type: ignore
             audit_historical_cache,
             augment_raw_session,
+            default_audit_manifest_path,
             default_hrs_cache_path,
             load_hrs_cache,
             load_raw_session,
@@ -1041,7 +1088,9 @@ def _try_write_from_quality_cache(
         print(f"[ffbridge-stats-builder] quality pipeline unavailable: {exc}", flush=True)
         return None
     try:
-        audit = audit_historical_cache(source_dir)
+        audit = audit_historical_cache(
+            source_dir, manifest_path=default_audit_manifest_path(source_dir)
+        )
     except Exception as exc:
         print(f"[ffbridge-stats-builder] cache audit failed: {exc}", flush=True)
         return None
@@ -1061,51 +1110,55 @@ def _try_write_from_quality_cache(
         complete = complete[:limit]
     if workers < 1:
         raise ValueError("workers must be at least 1")
+    candidate_ids = [session.session_id for session in complete]
+    if if_stale:
+        current, reason = _club_outputs_are_current(output_dir, candidate_ids)
+        if current:
+            print(f"[ffbridge-stats-builder] {reason}; skipping", flush=True)
+            return {
+                name: str(output_dir / name)
+                for name in (BOARD_FILENAME, HAND_FILENAME, PLAYER_FILENAME, CLUB_FILENAME)
+            }
+        print(f"[ffbridge-stats-builder] rebuilding: {reason}", flush=True)
     cache_file_path = default_hrs_cache_path(source_dir)
     hrs_cache: List[Any] = [load_hrs_cache(cache_file_path)]
     print(
-        f"[ffbridge-stats-builder] augmenting {len(complete)} cached sessions "
+        f"[ffbridge-stats-builder] checking {len(complete)} cached sessions "
         f"({workers} worker(s)); SD cache {cache_file_path}",
         flush=True,
     )
     lookup = load_session_lookup(source_dir)
     kept_ids: List[str] = []
-    player_acc: List[pl.DataFrame] = []
-    club_acc: List[pl.DataFrame] = []
-    empty_players = pl.DataFrame(
-        {"player_id": [], "first_name": [], "last_name": [], "club": []}
-    )
+    counts = {"resume": 0, "augment": 0, "skip": 0}
     from tqdm import tqdm
 
     def _record(
         session_id: str,
         status: str,
-        boards: Optional[pl.DataFrame],
         error: Optional[str],
         index: int,
         total: int,
     ) -> None:
         if error is not None:
+            counts["skip"] += 1
             print(
                 f"[ffbridge-stats-builder] skip session {session_id}: {error}",
                 flush=True,
             )
             return
-        assert boards is not None
         kept_ids.append(session_id)
-        nonlocal player_acc, club_acc
-        player_acc = _extend_unique(player_acc, map_players(boards), "player_id")
-        club_acc = _extend_unique(club_acc, map_clubs(boards), "id")
-        print(
-            f"[ffbridge-stats-builder] {index}/{total} session {session_id} {status}",
-            flush=True,
-        )
+        counts[status] += 1
+        if status != "resume":
+            print(
+                f"[ffbridge-stats-builder] {index}/{total} session {session_id} {status}",
+                flush=True,
+            )
 
     if workers == 1:
         iterator = tqdm(complete, desc="Club sessions")
         for index, session in enumerate(iterator, start=1):
             try:
-                session_id, status, boards, error = _process_club_session(
+                session_id, status, error = _process_club_session(
                     session,
                     source_dir=source_dir,
                     output_dir=output_dir,
@@ -1116,13 +1169,8 @@ def _try_write_from_quality_cache(
                     cache_file_path=cache_file_path,
                 )
             except Exception as exc:
-                session_id, status, boards, error = (
-                    session.session_id,
-                    "skip",
-                    None,
-                    str(exc),
-                )
-            _record(session_id, status, boards, error, index, len(complete))
+                session_id, status, error = session.session_id, "skip", str(exc)
+            _record(session_id, status, error, index, len(complete))
             if index % 50 == 0:
                 gc.collect()
     else:
@@ -1148,29 +1196,34 @@ def _try_write_from_quality_cache(
                 session = futures[future]
                 done += 1
                 try:
-                    session_id, status, boards, error = future.result()
+                    session_id, status, error = future.result()
                 except Exception as exc:
-                    session_id, status, boards, error = (
-                        session.session_id,
-                        "skip",
-                        None,
-                        str(exc),
-                    )
-                _record(session_id, status, boards, error, done, len(complete))
+                    session_id, status, error = session.session_id, "skip", str(exc)
+                _record(session_id, status, error, done, len(complete))
                 if done % 50 == 0:
                     gc.collect()
+    print(
+        f"[ffbridge-stats-builder] {counts['resume']} fragments reused, "
+        f"{counts['augment']} sessions augmented, {counts['skip']} skipped",
+        flush=True,
+    )
+    order = {session_id: index for index, session_id in enumerate(candidate_ids)}
+    kept_ids.sort(key=order.__getitem__)
     boards, hands = read_club_fragments(output_dir, kept_ids)
     if boards is None or boards.height == 0:
         return None
     if hands is None:
         hands = map_hand_records(boards)
-    players = _finalize_unique(player_acc, "player_id", empty_players)
-    if players.height == 0:
-        players = map_players(boards)
+    players = map_players(boards)
     boards, hands, players, clubs = apply_session_lookup(
         boards, hands, players, lookup
     )
-    return write_outputs(output_dir, boards, hands, players, clubs)
+    written = write_outputs(output_dir, boards, hands, players, clubs)
+    (output_dir / CLUB_MANIFEST_FILENAME).write_text(
+        json.dumps({"candidates": candidate_ids, "kept": kept_ids}),
+        encoding="utf-8",
+    )
+    return written
 
 
 def repair_club_dd_from_ddss(
@@ -1267,6 +1320,7 @@ def build(
     session_limit: Optional[int] = None,
     from_quality_cache: bool = False,
     workers: int = 8,
+    if_stale: bool = False,
 ) -> Dict[str, str]:
     if demo:
         boards, hands, players, clubs = demo_frames()
@@ -1276,7 +1330,7 @@ def build(
         if not source_dir:
             raise ValueError("--from-quality-cache requires --source-dir")
         written = _try_write_from_quality_cache(
-            source_dir, output_dir, session_limit, workers=workers
+            source_dir, output_dir, session_limit, workers=workers, if_stale=if_stale
         )
         if written:
             return written
@@ -1346,6 +1400,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Concurrent session augment workers (default: 8).",
     )
     parser.add_argument(
+        "--if-stale",
+        action="store_true",
+        help=(
+            "With --from-quality-cache, skip rewriting outputs when the candidate "
+            "sessions and their Club fragments are unchanged since the last build."
+        ),
+    )
+    parser.add_argument(
         "--repair-from-metadata",
         action="store_true",
         help="Fill Date/Club on existing Club parquets from session metadata.",
@@ -1392,6 +1454,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             session_limit=args.session_limit,
             from_quality_cache=args.from_quality_cache,
             workers=args.workers,
+            if_stale=args.if_stale,
         )
         print(json.dumps({"output_dir": str(output_dir), "files": written}, indent=2))
         return 0

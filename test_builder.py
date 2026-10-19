@@ -238,6 +238,69 @@ class BuilderTests(unittest.TestCase):
             self.assertEqual(got_boards.schema["Vul_Declarer"], pl.String)
             self.assertEqual(sorted(got_boards["Vul_Declarer"].unique().to_list()), ["N", "Y"])
 
+    def test_session_lookup_from_payloads_uses_stem_without_id(self) -> None:
+        lookup = builder.session_lookup_from_payloads(
+            [("77", {"date": "2024-02-03"}), ("x", {"id": 78})]
+        )
+        self.assertEqual(lookup["session_id"].to_list(), ["77", "78"])
+        self.assertEqual(lookup["Date"].to_list(), [datetime.date(2024, 2, 3), None])
+
+    def test_club_fragment_writer_overlays_lookup_and_skips_dropped(self) -> None:
+        class Session:
+            def __init__(self, session_id: str) -> None:
+                self.session_id = session_id
+                self.session_date = "2024-03-01"
+
+        augmented = pl.DataFrame(
+            {
+                "session_id": ["99"],
+                "Declarer_Direction": ["N"],
+                "Player_ID_N": ["1"],
+                "Player_ID_E": ["2"],
+                "Player_ID_S": ["3"],
+                "Player_ID_W": ["4"],
+                "PBN": ["N:AK..."],
+                "Board": [7],
+            }
+        )
+        lookup = builder.session_lookup_from_payloads(
+            [("99", {"id": 99, "date": "2024-03-02"})]
+        ).with_columns(pl.lit("750001").alias("Club"), pl.lit("Paris").alias("club_name"))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            writer = builder.ClubFragmentWriter(out, lookup)
+            writer(Session("99"), augmented)
+            dropped = next(iter(builder.DROPPED_SESSION_IDS))
+            writer(Session(dropped), augmented)
+            boards, hands = builder.read_club_fragments(out, ["99", dropped])
+            assert boards is not None and hands is not None
+            self.assertEqual(boards["Club"].to_list(), ["750001"])
+            self.assertEqual(boards["Date"].to_list(), [datetime.date(2024, 3, 2)])
+            self.assertFalse(builder._fragment_paths(out, dropped)[0].exists())
+
+    def test_club_outputs_are_current_until_candidates_or_fragments_change(self) -> None:
+        boards, hands, players, clubs = builder.demo_frames()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            builder.write_session_fragments(out, "s1", boards, hands)
+            builder.write_outputs(out, boards, hands, players, clubs)
+            current, reason = builder._club_outputs_are_current(out, ["s1", "s2"])
+            self.assertFalse(current, reason)
+            (out / builder.CLUB_MANIFEST_FILENAME).write_text(
+                json.dumps({"candidates": ["s1", "s2"], "kept": ["s1"]}), encoding="utf-8"
+            )
+            self.assertTrue(builder._club_outputs_are_current(out, ["s1", "s2"])[0])
+            self.assertFalse(builder._club_outputs_are_current(out, ["s1", "s2", "s3"])[0])
+            board_output = out / builder.BOARD_FILENAME
+            built_at = board_output.stat().st_mtime
+            fragment = builder._fragment_paths(out, "s1")[0]
+            import os
+
+            os.utime(fragment, (built_at + 10, built_at + 10))
+            current, reason = builder._club_outputs_are_current(out, ["s1", "s2"])
+            self.assertFalse(current)
+            self.assertIn("s1", reason)
+
 
 if __name__ == "__main__":
     unittest.main()
