@@ -24,6 +24,12 @@ class BridgeApiCommonTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             api_common.prepare_sql("PRAGMA show_tables", "club_board_results")
 
+    def test_run_duckdb_sql_caps_threads(self) -> None:
+        frame = api_common.run_duckdb_sql(
+            "SELECT current_setting('threads') AS threads", lambda con: None
+        )
+        self.assertEqual(frame["threads"][0], api_common.DUCKDB_THREADS)
+
     def test_data_root_search_paths(self) -> None:
         os.environ[api_common.DATA_ROOT_ENV] = "/data"
         self.assertEqual(

@@ -400,6 +400,24 @@ def _seat_player_expr(direction_col: str, prefix: str) -> pl.Expr:
     return expr
 
 
+def _declarer_id_from_seats(frame: pl.DataFrame) -> pl.DataFrame:
+    """Replace compass letters and the '-' / '' placeholders in Declarer with the seat's player id."""
+    stored = pl.col("Declarer").cast(pl.Utf8)
+    compass = stored.is_null() | stored.is_in(["N", "E", "S", "W", "O", "-", ""])
+    return frame.with_columns(
+        pl.when(compass)
+        .then(_seat_player_expr("Declarer_Direction", "Player_ID_"))
+        .otherwise(stored)
+        .alias("Declarer")
+    )
+
+
+def _name_declaring_seat(frame: pl.DataFrame) -> pl.DataFrame:
+    return frame.with_columns(
+        _seat_player_expr("Declarer_Direction", "Player_Name_").alias("Declarer_Name")
+    )
+
+
 def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
     """Normalize an augmented or raw FFBridge frame to Club board-result columns."""
     out = frame
@@ -440,15 +458,7 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
             _seat_player_expr("Declarer_Direction", "Player_ID_").alias("Declarer")
         )
     else:
-        out = out.with_columns(pl.col("Declarer").cast(pl.Utf8))
-        stored = pl.col("Declarer")
-        compass = stored.is_null() | stored.is_in(["N", "E", "S", "W", "O", "-", ""])
-        out = out.with_columns(
-            pl.when(compass)
-            .then(_seat_player_expr("Declarer_Direction", "Player_ID_"))
-            .otherwise(stored)
-            .alias("Declarer")
-        )
+        out = _declarer_id_from_seats(out)
 
     if "Dummy" not in out.columns:
         dummy = pl.lit(None, dtype=pl.Utf8)
@@ -478,17 +488,12 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
             )
         out = out.with_columns(right.alias("NotOnLead"))
 
-    if "Declarer_Name" not in out.columns:
-        name_col = _first_present(out, ("Player_Name_N", "firstName", "Declarer_Name"))
-        if name_col:
-            out = out.with_columns(pl.col(name_col).cast(pl.Utf8).alias("Declarer_Name"))
-        else:
-            out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("Declarer_Name"))
-
     for seat in SEATS:
         col = f"Player_Name_{seat}"
         if col not in out.columns:
             out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias(col))
+
+    out = _name_declaring_seat(out)
 
     score_col = _first_present(out, ("Score_Declarer", "nsScore", "NS_Score"))
     if score_col == "Score_Declarer":
@@ -908,7 +913,7 @@ def read_club_fragments(
             hand_paths.append(hand_path)
     boards = _concat_parquet_paths(board_paths)
     if boards is not None:
-        boards = _normalize_vul_declarer(boards)
+        boards = _name_declaring_seat(_declarer_id_from_seats(_normalize_vul_declarer(boards)))
     hands = _concat_parquet_paths(hand_paths)
     if hands is not None and "PBN" in hands.columns:
         hands = hands.unique(subset=["PBN"], maintain_order=True)

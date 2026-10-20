@@ -135,6 +135,29 @@ class BuilderTests(unittest.TestCase):
         out = builder.map_board_results(raw)
         self.assertEqual(out["Declarer"].to_list(), ["111"])
 
+    def test_map_board_results_names_the_declaring_seat(self) -> None:
+        raw = pl.DataFrame(
+            {
+                "session_id": ["99", "99", "99"],
+                "Declarer": ["333", "444", "-"],
+                "Declarer_Direction": ["S", "O", "-"],
+                "Declarer_Name": ["North", "North", "North"],
+                "Player_ID_N": ["111", "111", "111"],
+                "Player_ID_E": ["222", "222", "222"],
+                "Player_ID_S": ["333", "333", "333"],
+                "Player_ID_W": ["444", "444", "444"],
+                "Player_Name_N": ["North", "North", "North"],
+                "Player_Name_E": ["East", "East", "East"],
+                "Player_Name_S": ["South", "South", "South"],
+                "Player_Name_W": ["West", "West", "West"],
+                "Board": [1, 2, 3],
+                "PBN": ["N:AK...", "N:AK...", "N:AK..."],
+            }
+        )
+        out = builder.map_board_results(raw)
+        self.assertEqual(out["Declarer_Name"].to_list(), ["South", "West", None])
+        self.assertEqual(out["Declarer"].to_list(), ["333", "444", None])
+
     def test_map_board_results_parses_datetime_dates(self) -> None:
         raw = pl.DataFrame(
             {
@@ -237,6 +260,36 @@ class BuilderTests(unittest.TestCase):
             assert got_boards is not None
             self.assertEqual(got_boards.schema["Vul_Declarer"], pl.String)
             self.assertEqual(sorted(got_boards["Vul_Declarer"].unique().to_list()), ["N", "Y"])
+
+    def test_read_club_fragments_reattributes_declarer_from_seats(self) -> None:
+        boards, hands, _players, _clubs = builder.demo_frames()
+        stale = boards.with_columns(
+            pl.col("Player_Name_N").alias("Declarer_Name"),
+            pl.Series("Declarer", ["N", "-"]),
+            pl.Series("Declarer_Direction", ["N", "-"]),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            builder.write_session_fragments(out, "s1", stale, hands)
+            got_boards, _got_hands = builder.read_club_fragments(out, ["s1"])
+            assert got_boards is not None
+            self.assertEqual(got_boards["Declarer_Name"].to_list(), ["Robert Salita", None])
+            self.assertEqual(
+                got_boards["Declarer"].to_list(), [boards["Player_ID_N"][0], None]
+            )
+
+    def test_read_club_fragments_names_south_declarer(self) -> None:
+        boards, hands, _players, _clubs = builder.demo_frames()
+        stale = boards.with_columns(pl.col("Player_Name_N").alias("Declarer_Name"))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            builder.write_session_fragments(out, "s1", stale, hands)
+            got_boards, _got_hands = builder.read_club_fragments(out, ["s1"])
+            assert got_boards is not None
+            self.assertEqual(got_boards["Declarer_Direction"].to_list(), ["N", "S"])
+            self.assertEqual(
+                got_boards["Declarer_Name"].to_list(), ["Robert Salita", "Robert Salita"]
+            )
 
     def test_session_lookup_from_payloads_uses_stem_without_id(self) -> None:
         lookup = builder.session_lookup_from_payloads(
