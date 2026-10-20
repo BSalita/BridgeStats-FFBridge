@@ -86,13 +86,15 @@ def _run(callable_, /, *args, **kwargs):
 
 @app.get("/health")
 def health() -> dict:
-    info = _run(service.dataset_info)
+    """Process liveness. File paths and schemas are on /ffbridge-stats/dataset-info.
+
+    Deploy probes this every few seconds. Scanning parquet schemas here made
+    the probe reset the connection while Streamlit on :8524 was already up.
+    """
     return api_common.health_payload(
-        info,
         service="ffbridge-stats-api",
         api_version=app.version,
         build_tag=API_BUILD_TAG,
-        info_first=True,
     )
 
 
