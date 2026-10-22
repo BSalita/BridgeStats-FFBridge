@@ -1,7 +1,7 @@
 # Runtime for Streamlit UI + FastAPI / DuckDB data layer.
 altair
 beautifulsoup4
-duckdb
+duckdb>=1.5,<2
 fastapi
 httpx
 markdown
