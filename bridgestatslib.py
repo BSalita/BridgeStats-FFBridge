@@ -689,12 +689,13 @@ def apply_filters(board_results_df, clubs, players, pairs, start_date, end_date)
         pair_condition = None
         for pair in pairs:
             p1, p2 = pair.split("_")
-            current = (
-                (pl.col("Declarer").cast(pl.Utf8) == p1)
-                & (pl.col("Dummy").cast(pl.Utf8) == p2)
-            ) | (
-                (pl.col("Declarer").cast(pl.Utf8) == p2)
-                & (pl.col("Dummy").cast(pl.Utf8) == p1)
+            # Each side may be a license, Lancelot or Classic id.
+            ids1 = expand_ffbridge_player_numbers([p1])
+            ids2 = expand_ffbridge_player_numbers([p2])
+            declarer = pl.col("Declarer").cast(pl.Utf8)
+            dummy = pl.col("Dummy").cast(pl.Utf8)
+            current = (declarer.is_in(ids1) & dummy.is_in(ids2)) | (
+                declarer.is_in(ids2) & dummy.is_in(ids1)
             )
             pair_condition = (
                 current if pair_condition is None else pair_condition | current
@@ -1455,7 +1456,12 @@ def run_sql(
             raise ValueError(f"Invalid extra table name: {name}")
         if not isinstance(rows, list) or not rows:
             raise ValueError(f"Extra table {name} must be a non-empty list of rows")
-    sql, limit = api_common.prepare_sql(expand_sql(sql, meta), source, limit)
+    sql, limit = api_common.prepare_sql(
+        expand_sql(sql, meta),
+        source,
+        limit,
+        other_tables=("recent_club_games", *extras),
+    )
     path = resolve_source_path(source)
     escaped = str(path).replace("'", "''")
     schema_names = pl.read_parquet_schema(str(path)).keys()
@@ -1687,7 +1693,9 @@ def _prepare_board_frames(
         end_date=end_date,
     )
     if players:
-        selected = any_position.filter(pl.col("Declarer").is_in([str(p) for p in players]))
+        # Declarer holds one id form; a license or Lancelot id must match it too.
+        declarers = expand_ffbridge_player_numbers([str(p) for p in players])
+        selected = any_position.filter(pl.col("Declarer").cast(pl.Utf8).is_in(declarers))
     else:
         selected = any_position
     names = load_player_name_dict()

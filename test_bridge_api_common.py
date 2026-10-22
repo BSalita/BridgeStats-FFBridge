@@ -24,6 +24,17 @@ class BridgeApiCommonTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             api_common.prepare_sql("PRAGMA show_tables", "club_board_results")
 
+    def test_sql_reading_another_registered_table_is_not_prefixed(self) -> None:
+        recent = ("recent_club_games",)
+        sql, _ = api_common.prepare_sql(
+            "SELECT * FROM recent_club_games", "club_board_results", other_tables=recent
+        )
+        self.assertEqual(sql, "SELECT * FROM recent_club_games")
+        sql, _ = api_common.prepare_sql(
+            "SELECT extract(year FROM Date) AS y", "club_board_results", other_tables=recent
+        )
+        self.assertEqual(sql, "FROM self SELECT extract(year FROM Date) AS y")
+
     def test_run_duckdb_sql_caps_threads(self) -> None:
         frame = api_common.run_duckdb_sql(
             "SELECT current_setting('threads') AS threads", lambda con: None

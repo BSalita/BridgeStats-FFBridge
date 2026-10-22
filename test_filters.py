@@ -53,6 +53,29 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(df.height, 1)
         self.assertEqual(df["Dummy"][0], "9524304")
 
+    def test_apply_filters_pair_given_as_licenses_matches_classic_ids(self) -> None:
+        # Declarer and Dummy hold Classic ids; callers often pass licenses.
+        persons = pl.DataFrame(
+            {
+                "lancelot_person_id": ["11", "22"],
+                "classic_person_id": ["2663279", "9524304"],
+                "license_number": ["L-A", "L-B"],
+            }
+        )
+        from unittest.mock import patch
+
+        with patch.object(bridgestatslib, "load_person_aliases_df", return_value=persons):
+            df = apply_filters(
+                _board_results_df(),
+                clubs=[],
+                players=[],
+                pairs=["L-B_L-A"],
+                start_date=None,
+                end_date=None,
+            )
+        self.assertEqual(df.height, 1)
+        self.assertEqual(df["Declarer"][0], "2663279")
+
     def test_apply_filters_empty_when_outside_date_range(self) -> None:
         df = apply_filters(
             _board_results_df(),
