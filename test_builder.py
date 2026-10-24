@@ -201,6 +201,49 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(clubs["id"][0], "2300024")
         self.assertTrue((players["club"] == "2300024").all())
 
+    def test_session_lookup_keeps_fragment_values_it_has_no_value_for(self) -> None:
+        boards, hands, players, _clubs = builder.demo_frames()
+        boards = boards.with_columns(
+            pl.lit(datetime.date(2024, 2, 1)).alias("Date"),
+            pl.lit("9900001").alias("Club"),
+        )
+        hands = hands.with_columns(pl.lit(datetime.date(2024, 2, 1)).alias("game_date"))
+        # The session has a lookup row with a date but no club ("" or null),
+        # and a second lookup row for another session.
+        for missing_club in ("", None):
+            lookup = pl.DataFrame(
+                {
+                    "session_id": ["s1", "other"],
+                    "Date": [datetime.date(2024, 1, 15), datetime.date(2024, 5, 5)],
+                    "Club": [missing_club, "1234567"],
+                    "club_name": ["", "Other"],
+                },
+                schema={"session_id": pl.Utf8, "Date": pl.Date, "Club": pl.Utf8, "club_name": pl.Utf8},
+            )
+            out, out_hands, _players, _clubs = builder.apply_session_lookup(
+                boards, hands, players, lookup
+            )
+            self.assertTrue((out["Club"] == "9900001").all())
+            self.assertTrue((out["Date"] == datetime.date(2024, 1, 15)).all())
+            self.assertTrue((out_hands["game_date"] == datetime.date(2024, 1, 15)).all())
+        # A session missing from the lookup keeps its own Date and Club.
+        lookup = pl.DataFrame(
+            {"session_id": ["other"], "Date": [datetime.date(2024, 5, 5)], "Club": ["1234567"], "club_name": ["Other"]}
+        )
+        out, out_hands, _players, _clubs = builder.apply_session_lookup(boards, hands, players, lookup)
+        self.assertTrue((out["Club"] == "9900001").all())
+        self.assertTrue((out["Date"] == datetime.date(2024, 2, 1)).all())
+        self.assertTrue((out_hands["game_date"] == datetime.date(2024, 2, 1)).all())
+
+    def test_session_lookup_keeps_row_order(self) -> None:
+        boards, hands, players, _clubs = builder.demo_frames()
+        boards = pl.concat([boards] * 50).with_columns(pl.int_range(pl.len()).alias("Board"))
+        lookup = pl.DataFrame(
+            {"session_id": ["s1"], "Date": [datetime.date(2024, 1, 15)], "Club": ["2300024"], "club_name": ["x"]}
+        )
+        out, _hands, _players, _clubs = builder.apply_session_lookup(boards, hands, players, lookup)
+        self.assertEqual(out["Board"].to_list(), boards["Board"].to_list())
+
     def test_load_session_lookup_reads_ffb_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "data"
@@ -353,6 +396,34 @@ class BuilderTests(unittest.TestCase):
             current, reason = builder._club_outputs_are_current(out, ["s1", "s2"])
             self.assertFalse(current)
             self.assertIn("s1", reason)
+
+    def test_skipped_session_is_picked_up_when_its_fragment_appears(self) -> None:
+        import os
+
+        boards, hands, players, clubs = builder.demo_frames()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            builder.write_session_fragments(out, "s1", boards, hands)
+            builder.write_outputs(out, boards, hands, players, clubs)
+            # Last build kept s1 and skipped s2.
+            (out / builder.CLUB_MANIFEST_FILENAME).write_text(
+                json.dumps({"candidates": ["s1", "s2"], "kept": ["s1"]}), encoding="utf-8"
+            )
+            built_at = (out / builder.BOARD_FILENAME).stat().st_mtime
+            os.utime(builder._fragment_paths(out, "s1")[0], (built_at - 10, built_at - 10))
+            os.utime(builder._fragment_paths(out, "s1")[1], (built_at - 10, built_at - 10))
+            self.assertTrue(builder._club_outputs_are_current(out, ["s1", "s2"])[0])
+            # A fragment for s2 older than the build (it kept failing) does not force a rebuild.
+            builder.write_session_fragments(out, "s2", boards, hands)
+            for path in builder._fragment_paths(out, "s2"):
+                os.utime(path, (built_at - 5, built_at - 5))
+            self.assertTrue(builder._club_outputs_are_current(out, ["s1", "s2"])[0])
+            # A fragment written after the build does.
+            for path in builder._fragment_paths(out, "s2"):
+                os.utime(path, (built_at + 10, built_at + 10))
+            current, reason = builder._club_outputs_are_current(out, ["s1", "s2"])
+            self.assertFalse(current)
+            self.assertIn("s2", reason)
 
 
 if __name__ == "__main__":

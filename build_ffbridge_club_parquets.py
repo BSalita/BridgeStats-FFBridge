@@ -184,26 +184,51 @@ def session_lookup_from_payloads(
     )
 
 
+def _prefer_lookup(
+    frame: pl.DataFrame, meta: pl.DataFrame, columns: Mapping[str, str]
+) -> pl.DataFrame:
+    """Left-join ``meta`` on session_id; each frame column takes the lookup
+    value when there is one and keeps its own value otherwise.
+
+    ``columns`` maps a frame column to its ``meta`` column. Fragments already
+    carry the lookup values (``_overlay_session_lookup``), so a session that is
+    missing from the lookup, or has no Club there, must not lose its values here.
+    Row order is kept: stage 5 hashes the train rows in order.
+    """
+    renamed = {source: f"_lookup_{target}" for target, source in columns.items()}
+    out = frame.with_columns(pl.col("session_id").cast(pl.Utf8)).join(
+        meta.select("session_id", *renamed).rename(renamed),
+        on="session_id",
+        how="left",
+        maintain_order="left",
+    )
+    exprs = []
+    for target in columns:
+        lookup_value = pl.col(f"_lookup_{target}")
+        if target in frame.columns:
+            exprs.append(
+                pl.coalesce(lookup_value, pl.col(target).cast(meta.schema[columns[target]]))
+                .alias(target)
+            )
+        else:
+            exprs.append(lookup_value.alias(target))
+    return out.with_columns(exprs).drop([f"_lookup_{target}" for target in columns])
+
+
 def _attach_board_lookup(boards: pl.DataFrame, lookup: pl.DataFrame) -> pl.DataFrame:
-    meta = lookup.select("session_id", "Date", "Club")
-    out = boards.with_columns(pl.col("session_id").cast(pl.Utf8))
-    drop = [name for name in ("Date", "Club") if name in out.columns]
-    if drop:
-        out = out.drop(drop)
-    out = out.join(meta, on="session_id", how="left")
+    # An empty Club in the lookup means "unknown", like null.
+    meta = lookup.select(
+        "session_id",
+        "Date",
+        pl.when(pl.col("Club") == "").then(None).otherwise(pl.col("Club")).alias("Club"),
+    )
+    out = _prefer_lookup(boards, meta, {"Date": "Date", "Club": "Club"})
     out = _with_dealer(out)
     return out.select(list(BOARD_RESULT_COLUMNS))
 
 
 def _attach_hand_lookup(hands: pl.DataFrame, lookup: pl.DataFrame) -> pl.DataFrame:
-    meta = lookup.select(
-        pl.col("session_id"),
-        pl.col("Date").alias("game_date"),
-    )
-    out = hands.with_columns(pl.col("session_id").cast(pl.Utf8))
-    if "game_date" in out.columns:
-        out = out.drop("game_date")
-    out = out.join(meta, on="session_id", how="left")
+    out = _prefer_lookup(hands, lookup, {"game_date": "Date"})
     return out.select(list(HAND_RECORD_COLUMNS))
 
 
@@ -1043,7 +1068,14 @@ CLUB_MANIFEST_FILENAME = "ffbridge_club_manifest.json"
 def _club_outputs_are_current(
     output_dir: pathlib.Path, candidate_ids: Sequence[str]
 ) -> Tuple[bool, str]:
-    """Outputs are current when built from these candidates and no kept fragment changed since."""
+    """Outputs are current when built from these candidates and no fragment changed since.
+
+    Checks the kept sessions' fragments, and the fragments of candidates the
+    last build skipped: a skipped session whose fragment was written after the
+    build (for example by the quality builder's hook) must be picked up.
+    Existence alone is not enough, or a session that keeps failing would force
+    a rebuild every run.
+    """
     manifest_path = output_dir / CLUB_MANIFEST_FILENAME
     board_output = output_dir / BOARD_FILENAME
     if not manifest_path.is_file() or not board_output.is_file():
@@ -1058,6 +1090,13 @@ def _club_outputs_are_current(
                 return False, f"fragment missing for session {session_id}"
             if path.stat().st_mtime > built_at:
                 return False, f"fragment newer than outputs for session {session_id}"
+    kept = set(manifest["kept"])
+    for session_id in candidate_ids:
+        if session_id in kept:
+            continue
+        board_path, _hand_path = _fragment_paths(output_dir, session_id)
+        if board_path.is_file() and board_path.stat().st_mtime > built_at:
+            return False, f"fragment written for skipped session {session_id}"
     return True, f"{len(manifest['kept'])} session fragments unchanged since last build"
 
 
