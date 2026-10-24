@@ -292,6 +292,47 @@ class BuilderTests(unittest.TestCase):
         self.assertTrue(got.equals(expected))
         self.assertEqual(got["session_id"].to_list(), ["a", "a", "b", "c"])
 
+    def test_simultaneous_sessions_get_each_pairs_host_club(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            ranking_dir = source / "results" / "sessions" / "sim1"
+            ranking_dir.mkdir(parents=True)
+
+            def entry(club, a, b):
+                return {"simultaneousId": club, "team": {"player1": {"migrationId": a}, "player2": {"migrationId": b}}}
+
+            ranking_dir.joinpath("ranking.json").write_text(
+                json.dumps(
+                    [
+                        entry(6000029, 11, 12),
+                        entry(6000029, 13, 14),
+                        entry(5400003, 22, 21),  # ids stored in either order
+                        entry(5400003, 23, 24),
+                        entry(9999999, 11, 12),  # duplicate pair: first entry wins
+                        {"simultaneousId": 1, "team": {"player1": "bad", "player2": None}},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            pairs = builder.load_simultaneous_pair_clubs(source, ["sim1", "missing"])
+        self.assertEqual(pairs.height, 4)
+        boards = pl.DataFrame(
+            {
+                "session_id": ["sim1", "sim1", "sim1", "sim1", "club"],
+                "Club": [None, "", None, None, "2300024"],
+                "Player_ID_N": ["11", "21", "99", "99", "11"],
+                "Player_ID_S": ["12", "22", "98", "98", "12"],
+                "Player_ID_E": ["13", "23", "23", "97", "13"],
+                "Player_ID_W": ["14", "24", "24", "96", "14"],
+                "Board": [1, 2, 3, 4, 5],
+            }
+        )
+        out = builder.fill_simultaneous_clubs(boards, pairs)
+        # NS pair's club first; EW pair's when NS is unknown; existing Club kept.
+        self.assertEqual(out["Club"].to_list(), ["6000029", "5400003", "5400003", None, "2300024"])
+        self.assertEqual(out.columns, boards.columns)
+        self.assertEqual(out["Board"].to_list(), [1, 2, 3, 4, 5])
+
     def test_session_lookup_keeps_row_order(self) -> None:
         boards, hands, players, _clubs = builder.demo_frames()
         boards = pl.concat([boards] * 50).with_columns(pl.int_range(pl.len()).alias("Board"))

@@ -136,6 +136,86 @@ def _parse_session_club(payload: Mapping[str, Any]) -> tuple[Optional[str], Opti
     return code, name
 
 
+_PAIR_CLUB_SCHEMA = {"session_id": pl.Utf8, "_pair_a": pl.Utf8, "_pair_b": pl.Utf8, "_pair_club": pl.Utf8}
+
+
+def _ranking_pair_clubs(source_dir: pathlib.Path, session_id: str) -> List[Tuple[str, str, str, str]]:
+    """(session_id, smaller player id, larger player id, host club) per ranking entry.
+
+    Simultaneous sessions (e.g. FESTIVAL DES SIMULTANÉS) are played across
+    many clubs, so their session metadata has no club. Each ranking entry's
+    ``simultaneousId`` is the club that pair played at (it matches the Elo
+    results' club_id for 99.99% of pairs). Player ids are Lancelot
+    ``migrationId``s, the ids the board rows use.
+    """
+    path = pathlib.Path(source_dir) / "results" / "sessions" / session_id / "ranking.json"
+    if not path.is_file():
+        return []
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+    for entry in entries if isinstance(entries, list) else []:
+        club = entry.get("simultaneousId") if isinstance(entry, dict) else None
+        team = entry.get("team") if isinstance(entry, dict) else None
+        if club is None or not isinstance(team, dict):
+            continue
+        first, second = team.get("player1"), team.get("player2")
+        if not (isinstance(first, dict) and isinstance(second, dict)):
+            continue
+        if first.get("migrationId") is None or second.get("migrationId") is None:
+            continue
+        a, b = str(first["migrationId"]), str(second["migrationId"])
+        rows.append((session_id, min(a, b), max(a, b), str(club)))
+    return rows
+
+
+def load_simultaneous_pair_clubs(
+    source_dir: pathlib.Path, session_ids: Sequence[str]
+) -> pl.DataFrame:
+    """Host club per (session, pair) for sessions whose metadata has no club.
+
+    A pair listed twice with different clubs (rare) keeps its first entry.
+    """
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        parts = list(pool.map(lambda sid: _ranking_pair_clubs(source_dir, sid), session_ids))
+    rows = [row for part in parts for row in part]
+    return pl.DataFrame(rows, schema=_PAIR_CLUB_SCHEMA, orient="row").unique(
+        subset=["session_id", "_pair_a", "_pair_b"], keep="first", maintain_order=True
+    )
+
+
+def fill_simultaneous_clubs(boards: pl.DataFrame, pair_clubs: pl.DataFrame) -> pl.DataFrame:
+    """Fill a null Club from the NS pair's host club, else the EW pair's.
+
+    Rows that already have a Club keep it. At one table both pairs play at the
+    same club (they agree on 99.99% of rows where both are known).
+    """
+    if pair_clubs.height == 0 or "Club" not in boards.columns:
+        return boards
+    out = boards
+    found = []
+    for name, left, right in (("NS", "N", "S"), ("EW", "E", "W")):
+        a, b = pl.col(f"Player_ID_{left}").cast(pl.Utf8), pl.col(f"Player_ID_{right}").cast(pl.Utf8)
+        out = (
+            out.with_columns(
+                pl.col("session_id").cast(pl.Utf8),
+                pl.min_horizontal(a, b).alias("_pair_a"),
+                pl.max_horizontal(a, b).alias("_pair_b"),
+            )
+            .join(
+                pair_clubs.rename({"_pair_club": f"_club_{name}"}),
+                on=["session_id", "_pair_a", "_pair_b"],
+                how="left",
+                maintain_order="left",
+            )
+            .drop("_pair_a", "_pair_b")
+        )
+        found.append(f"_club_{name}")
+    club = pl.col("Club").cast(pl.Utf8)
+    return out.with_columns(
+        pl.coalesce(pl.when(club == "").then(None).otherwise(club), *found).alias("Club")
+    ).drop(found)
+
+
 def load_session_lookup(source_dir: pathlib.Path) -> pl.DataFrame:
     """session_id -> Date / Club / club_name from Lancelot session metadata."""
     sessions_dir = pathlib.Path(source_dir) / "competitions" / "sessions"
@@ -1268,6 +1348,17 @@ def _try_write_from_quality_cache(
     boards, hands = read_club_fragments(output_dir, kept_ids)
     if boards is None or boards.height == 0:
         return None
+    lookup_clubs = set(
+        lookup.filter(pl.col("Club").is_not_null() & (pl.col("Club") != ""))["session_id"].to_list()
+    )
+    simultaneous_ids = [session_id for session_id in kept_ids if session_id not in lookup_clubs]
+    pair_clubs = load_simultaneous_pair_clubs(source_dir, simultaneous_ids)
+    boards = fill_simultaneous_clubs(boards, pair_clubs)
+    print(
+        f"[ffbridge-stats-builder] host clubs for {len(simultaneous_ids)} sessions without a "
+        f"session club; Club still unknown on {boards['Club'].null_count():,} board rows",
+        flush=True,
+    )
     if hands is None:
         hands = map_hand_records(boards)
     players = map_players(boards)
