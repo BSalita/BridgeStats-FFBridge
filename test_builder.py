@@ -235,6 +235,44 @@ class BuilderTests(unittest.TestCase):
         self.assertTrue((out["Date"] == datetime.date(2024, 2, 1)).all())
         self.assertTrue((out_hands["game_date"] == datetime.date(2024, 2, 1)).all())
 
+    def test_map_players_keeps_each_players_first_row_and_splits_names(self) -> None:
+        boards = pl.DataFrame(
+            {
+                "Player_ID_N": ["1", "2", "1", None, ""],
+                "Player_Name_N": ["  Anne Marie DUPONT ", "Solo", "Later Name", "x", "y"],
+                "Player_ID_E": ["3", "1", "4", "5", "6"],
+                "Player_Name_E": ["Bob  LEE", "From East", None, "", "Zoe"],
+                "Club": ["c1", "c2", "c3", "c4", None],
+            }
+        )
+        players = builder.map_players(boards)
+        # Seat N first, then E; within a seat, board order. Player 1 keeps
+        # their first N row, not the later N row or the E row.
+        self.assertEqual(players["player_id"].to_list(), ["1", "2", "3", "4", "5", "6"])
+        by_id = {row["player_id"]: row for row in players.iter_rows(named=True)}
+        self.assertEqual((by_id["1"]["first_name"], by_id["1"]["last_name"]), ("Anne", "Marie DUPONT"))
+        self.assertEqual((by_id["1"]["club"]), "c1")
+        self.assertEqual((by_id["2"]["first_name"], by_id["2"]["last_name"]), ("Solo", ""))
+        self.assertEqual((by_id["3"]["first_name"], by_id["3"]["last_name"]), ("Bob", " LEE"))
+        self.assertEqual((by_id["4"]["first_name"], by_id["4"]["last_name"]), ("", ""))
+        self.assertEqual(by_id["6"]["club"], "")
+
+    def test_player_club_ties_pick_the_smallest_code(self) -> None:
+        players = pl.DataFrame({"player_id": ["9", "1"], "first_name": ["a", "b"], "last_name": ["", ""], "club": ["", ""]})
+        boards = pl.DataFrame(
+            {
+                "Player_ID_N": ["1", "1", "9", "9", "9"],
+                "Player_ID_E": ["2", "2", "2", "2", "2"],
+                "Player_ID_S": ["3", "3", "3", "3", "3"],
+                "Player_ID_W": ["4", "4", "4", "4", "4"],
+                "Club": ["7000002", "7000001", "5", "6", "6"],
+            }
+        )
+        for _ in range(5):
+            out = builder._fill_player_clubs(players, boards)
+            self.assertEqual(out["player_id"].to_list(), ["9", "1"])
+            self.assertEqual(out["club"].to_list(), ["6", "7000001"])
+
     def test_session_lookup_keeps_row_order(self) -> None:
         boards, hands, players, _clubs = builder.demo_frames()
         boards = pl.concat([boards] * 50).with_columns(pl.int_range(pl.len()).alias("Board"))

@@ -267,12 +267,13 @@ def _fill_player_clubs(players: pl.DataFrame, boards: pl.DataFrame) -> pl.DataFr
             & (pl.col("club") != "")
         )
         .group_by("player_id")
-        .agg(pl.col("club").mode().first().alias("club"))
+        # The most frequent club; on a tie, the smallest club code, so reruns agree.
+        .agg(pl.col("club").mode().sort().first().alias("club"))
     )
     out = players.with_columns(pl.col("player_id").cast(pl.Utf8))
     if "club" in out.columns:
         out = out.drop("club")
-    return out.join(mode, on="player_id", how="left").with_columns(
+    return out.join(mode, on="player_id", how="left", maintain_order="left").with_columns(
         pl.col("club").cast(pl.Utf8).fill_null("")
     )
 
@@ -713,42 +714,51 @@ def map_hand_records(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def map_players(frame: pl.DataFrame) -> pl.DataFrame:
-    rows: List[Dict[str, str]] = []
+    """One row per player: the first row that player appears on, scanning
+    seats N, E, S, W and then board rows in order, so the result does not
+    depend on how Polars schedules the work.
+
+    The display name splits at its first space into first and last name.
+    """
     club_col = _first_present(frame, ("Club", "club_code", "club"))
+    seats = []
     for seat in SEATS:
         id_col = f"Player_ID_{seat}"
         if id_col not in frame.columns:
             continue
         name_col = f"Player_Name_{seat}"
-        exprs = [pl.col(id_col).cast(pl.Utf8).alias("player_id")]
-        if name_col in frame.columns:
-            exprs.append(pl.col(name_col).cast(pl.Utf8).alias("display_name"))
-        else:
-            exprs.append(pl.lit("").alias("display_name"))
-        exprs.append(
-            pl.col(club_col).cast(pl.Utf8).alias("club")
-            if club_col
-            else pl.lit("").alias("club")
-        )
-        work = frame.select(exprs).filter(
-            pl.col("player_id").is_not_null() & (pl.col("player_id") != "")
-        )
-        for rec in work.unique(subset=["player_id"]).iter_rows(named=True):
-            name = str(rec.get("display_name") or "").strip()
-            parts = name.split(" ", 1) if name else ["", ""]
-            rows.append(
-                {
-                    "player_id": rec["player_id"],
-                    "first_name": parts[0],
-                    "last_name": parts[1] if len(parts) > 1 else "",
-                    "club": rec.get("club") or "",
-                }
+        seats.append(
+            frame.select(
+                pl.col(id_col).cast(pl.Utf8).alias("player_id"),
+                (
+                    pl.col(name_col).cast(pl.Utf8)
+                    if name_col in frame.columns
+                    else pl.lit("", dtype=pl.Utf8)
+                ).alias("display_name"),
+                (
+                    pl.col(club_col).cast(pl.Utf8)
+                    if club_col
+                    else pl.lit("", dtype=pl.Utf8)
+                ).alias("club"),
             )
-    if not rows:
-        return pl.DataFrame(
-            {"player_id": [], "first_name": [], "last_name": [], "club": []}
         )
-    return pl.DataFrame(rows).unique(subset=["player_id"], maintain_order=True)
+    schema = {"player_id": pl.Utf8, "first_name": pl.Utf8, "last_name": pl.Utf8, "club": pl.Utf8}
+    if not seats:
+        return pl.DataFrame(schema=schema)
+    names = (
+        pl.col("display_name").fill_null("").str.strip_chars().str.splitn(" ", 2)
+    )
+    return (
+        pl.concat(seats, how="vertical")
+        .filter(pl.col("player_id").is_not_null() & (pl.col("player_id") != ""))
+        .unique(subset=["player_id"], keep="first", maintain_order=True)
+        .select(
+            "player_id",
+            names.struct.field("field_0").fill_null("").alias("first_name"),
+            names.struct.field("field_1").fill_null("").alias("last_name"),
+            pl.col("club").fill_null("").alias("club"),
+        )
+    )
 
 
 def map_clubs(frame: pl.DataFrame) -> pl.DataFrame:
