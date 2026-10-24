@@ -273,6 +273,25 @@ class BuilderTests(unittest.TestCase):
             self.assertEqual(out["player_id"].to_list(), ["9", "1"])
             self.assertEqual(out["club"].to_list(), ["6", "7000001"])
 
+    def test_concat_fragments_matches_lazy_concat_across_schemas(self) -> None:
+        frames = [
+            pl.DataFrame({"session_id": ["a", "a"], "Board": [1, 2], "Vul_Declarer": [True, False]}),
+            pl.DataFrame({"session_id": ["b"], "Board": [1], "Vul_Declarer": ["Y"], "Extra": [7.5]}),
+            pl.DataFrame({"session_id": ["c"], "Board": [3]}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for index, frame in enumerate(frames):
+                path = Path(tmp) / f"{index}.parquet"
+                frame.write_parquet(path)
+                paths.append(path)
+            got = builder._concat_parquet_paths([*paths, Path(tmp) / "missing.parquet"])
+            expected = pl.concat([pl.scan_parquet(p) for p in paths], how="diagonal_relaxed").collect()
+        assert got is not None
+        self.assertEqual(got.schema, expected.schema)
+        self.assertTrue(got.equals(expected))
+        self.assertEqual(got["session_id"].to_list(), ["a", "a", "b", "c"])
+
     def test_session_lookup_keeps_row_order(self) -> None:
         boards, hands, players, _clubs = builder.demo_frames()
         boards = pl.concat([boards] * 50).with_columns(pl.int_range(pl.len()).alias("Board"))

@@ -908,10 +908,12 @@ def _concat_parquet_paths(paths: Sequence[pathlib.Path]) -> Optional[pl.DataFram
         return pl.read_parquet(existing[0])
     # Fragments were written across schema revisions (e.g. Vul_Declarer
     # Boolean vs String). scan_parquet(list) requires one schema.
-    return pl.concat(
-        [pl.scan_parquet(path) for path in existing],
-        how="diagonal_relaxed",
-    ).collect()
+    # Read eagerly, then concat once: a lazy concat of one scan per fragment
+    # grows about quadratically with the fragment count (2,000 fragments:
+    # 31.5s lazy vs 4.2s eager; all 7,301 took many minutes).
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        frames = list(pool.map(pl.read_parquet, existing))
+    return pl.concat(frames, how="diagonal_relaxed")
 
 
 def _normalize_vul_declarer(frame: pl.DataFrame) -> pl.DataFrame:
