@@ -1,5 +1,4 @@
 import streamlit as st
-import pandas as pd
 
 import app_info
 
@@ -17,7 +16,7 @@ st.subheader("Club filters use FFBridge club codes so a simultaneous session can
 st.subheader("A Connection Error is usually due to a lack of memory on the server. Try either reloading the webpage immediately or come back later.")
 st.subheader("An Error 410 requires that you clear your browser's cache before proceeding.")
 st.caption("Project lead is Robert Salita research@AiPolice.org. Code written in Python and is currently not publically available. UI is written in Streamlit. Database is parquet. Query engine is DuckDB. Website is self-hosted using Ubuntu and Cloudflare Tunnel.")
-st.caption(f"Pandas:{pd.__version__}")
+st.caption(app_info.package_versions_line())
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Other Morty websites**")
