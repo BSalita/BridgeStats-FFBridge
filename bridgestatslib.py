@@ -52,6 +52,20 @@ BOARD_RESULT_COLUMNS = (
     "Dummy",
     "OnLead",
     "NotOnLead",
+    "Lead",
+    "DD_Lead_Cost",
+    "Lead_Is_DD_Best",
+    "SD_Lead_Tricks",
+    "SD_Lead_Best_Tricks",
+    "SD_Lead_Cost",
+    "SD_Lead_Is_Best",
+    "SD_Lead_Best_Card",
+    "SD_Lead_Rank",
+    "SD_Lead_Set_Pct",
+    "SD_Lead_Best_Set_Pct",
+    "SD_Lead_Set_Cost",
+    "SD_Lead_Luck",
+    "SD_Lead_Samples",
     "Declarer_Name",
     "Player_ID_N",
     "Player_ID_E",
@@ -85,6 +99,46 @@ BOARD_RESULT_COLUMNS = (
     "ContractType",
     "PBN",
 )
+
+# Opening-lead scores. Null when the lead is missing or not scored; the SD_Lead_*
+# columns stay null unless the builder runs with --sd-lead-samples.
+LEAD_SCORE_DTYPES = {
+    "Lead": pl.Utf8,
+    "DD_Lead_Cost": pl.UInt8,
+    "Lead_Is_DD_Best": pl.Boolean,
+    "SD_Lead_Tricks": pl.Float32,
+    "SD_Lead_Best_Tricks": pl.Float32,
+    "SD_Lead_Cost": pl.Float32,
+    "SD_Lead_Is_Best": pl.Boolean,
+    "SD_Lead_Best_Card": pl.Utf8,
+    "SD_Lead_Rank": pl.UInt8,
+    "SD_Lead_Set_Pct": pl.Float32,
+    "SD_Lead_Best_Set_Pct": pl.Float32,
+    "SD_Lead_Set_Cost": pl.Float32,
+    "SD_Lead_Luck": pl.Float32,
+    "SD_Lead_Samples": pl.UInt16,
+}
+
+# SuitC (mlBridgeSuitCLib): null unless the builder runs with --suitc.
+# Board level: the declaring partnership's guess cost and the guess-adjusted
+# tricks-vs-double-dummy difference.
+SC_BOARD_DTYPES = {
+    "SC_Guess_Declarer": pl.Float32,
+    "DD_Tricks_Diff_SC": pl.Float32,
+}
+# Deal level: per partnership and suit, plus partnership totals.
+SC_HAND_DTYPES = {
+    **{
+        f"SC_{stat}_{pair}_{suit}": pl.Float32
+        for pair in ("NS", "EW")
+        for suit in "SHDC"
+        for stat in ("ET", "DDx", "Guess", "Stop", "Block")
+    },
+    **{f"SC_{stat}_{pair}": pl.Float32 for pair in ("NS", "EW") for stat in ("ET", "Guess")},
+}
+BOARD_RESULT_COLUMNS = (*BOARD_RESULT_COLUMNS, *SC_BOARD_DTYPES)
+# Columns written with a fixed dtype (typed nulls when not computed).
+BOARD_TYPED_COLUMNS = {**LEAD_SCORE_DTYPES, **SC_BOARD_DTYPES}
 
 BOARD_RESULT_OPTIONAL_COLUMNS = (
     "Club",
@@ -138,6 +192,7 @@ HAND_RECORD_COLUMNS = (
     "DP_N_S",
     "DP_NS",
     "DP_EW",
+    *SC_HAND_DTYPES,
 )
 
 SORT_OPTIONS = [

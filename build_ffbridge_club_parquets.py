@@ -27,6 +27,10 @@ import polars as pl
 
 from bridgestatslib import (
     BOARD_RESULT_COLUMNS,
+    LEAD_SCORE_DTYPES,
+    BOARD_TYPED_COLUMNS,
+    SC_BOARD_DTYPES,
+    SC_HAND_DTYPES,
     HAND_RECORD_COLUMNS,
     resolve_data_path,
 )
@@ -41,6 +45,7 @@ HAND_FILENAME = "ffbridge_club_hand_records_augmented_narrow.parquet"
 PLAYER_FILENAME = "ffbridge_player_info.parquet"
 CLUB_FILENAME = "ffbridge_clubs.parquet"
 CLUB_FRAGMENT_DIRNAME = "club_session_fragments"
+SD_LEAD_CACHE_DIRNAME = "ffbridge_sd_lead_cache"
 # Cross-section Lancelot rows trip convert_ffdf_lancelot_to_mldf. One session
 # is not worth keeping the converter's same-section assert.
 DROPPED_SESSION_IDS = {
@@ -713,10 +718,11 @@ def map_board_results(frame: pl.DataFrame) -> pl.DataFrame:
 
     selected = []
     for col in BOARD_RESULT_COLUMNS:
+        dtype = BOARD_TYPED_COLUMNS.get(col)
         if col in out.columns:
-            selected.append(pl.col(col))
+            selected.append(pl.col(col) if dtype is None else pl.col(col).cast(dtype))
         else:
-            selected.append(pl.lit(None).alias(col))
+            selected.append(pl.lit(None, dtype=dtype).alias(col))
     return out.select(selected)
 
 
@@ -789,6 +795,10 @@ def map_hand_records(frame: pl.DataFrame) -> pl.DataFrame:
                 out = out.with_columns(pl.col(alias).alias(col))
             else:
                 out = out.with_columns(pl.lit(default).alias(col))
+    out = out.with_columns(
+        pl.col(col).cast(dtype) if col in out.columns else pl.lit(None, dtype=dtype).alias(col)
+        for col, dtype in SC_HAND_DTYPES.items()
+    )
     out = out.unique(subset=["PBN"], maintain_order=True)
     return out.select(list(HAND_RECORD_COLUMNS))
 
@@ -891,6 +901,9 @@ def demo_frames() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFram
             "Dummy": ["282839", "246273"],
             "OnLead": ["111111", "222222"],
             "NotOnLead": ["333333", "444444"],
+            "Lead": ["SK", "D2"],
+            "DD_Lead_Cost": pl.Series([0, 1], dtype=pl.UInt8),
+            "Lead_Is_DD_Best": [True, False],
             "Declarer_Name": ["Robert", "Kerry"],
             "Player_ID_N": ["246273", "282839"],
             "Player_ID_E": ["111111", "222222"],
@@ -923,6 +936,10 @@ def demo_frames() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFram
             "ContractType": ["game", "game"],
             "PBN": ["N:AKQxxx.xxx.xxx.xx E:...", "N:AKQxxx.xxx.xxx.xx E:..."],
         }
+    ).with_columns(
+        pl.lit(None, dtype=dtype).alias(col)
+        for col, dtype in BOARD_TYPED_COLUMNS.items()
+        if col.startswith("SD_Lead_") or col in SC_BOARD_DTYPES
     )
     hands = map_hand_records(boards.with_columns(pl.col("Date").alias("game_date")))
     players = pl.DataFrame(
@@ -1119,12 +1136,45 @@ class ClubFragmentWriter:
             )
 
 
-def _club_fragment_is_current(board_path: pathlib.Path, hand_path: pathlib.Path) -> bool:
+def _club_fragment_is_current(
+    board_path: pathlib.Path, hand_path: pathlib.Path, sd_lead_samples: int = 0, suitc: bool = False
+) -> bool:
+    if not _club_fragment_is_current_lead(board_path, hand_path, sd_lead_samples):
+        return False
+    if suitc:
+        # Every declared board must carry the SuitC guess cost.
+        if "SC_Guess_Declarer" not in pl.read_parquet_schema(board_path):
+            return False
+        board = pl.read_parquet(board_path, columns=["Declarer_Direction", "SC_Guess_Declarer"])
+        return not board.select(
+            (pl.col("Declarer_Direction").is_in(["N", "E", "S", "W"]) & pl.col("SC_Guess_Declarer").is_null()).any()
+        ).item()
+    return True
+
+
+def _club_fragment_is_current_lead(
+    board_path: pathlib.Path, hand_path: pathlib.Path, sd_lead_samples: int = 0
+) -> bool:
     if not (board_path.is_file() and hand_path.is_file()):
         return False
-    if "EV_Score_Declarer" not in pl.read_parquet_schema(board_path):
+    schema = pl.read_parquet_schema(board_path)
+    # Fragments written before opening-lead scoring are rebuilt once.
+    if "EV_Score_Declarer" not in schema or "DD_Lead_Cost" not in schema:
         return False
-    return _club_fragment_has_ev(pl.read_parquet(board_path, columns=["EV_Score_Declarer"]))
+    if not _club_fragment_has_ev(pl.read_parquet(board_path, columns=["EV_Score_Declarer"])):
+        return False
+    if sd_lead_samples > 0:
+        # Every DD-scored lead must carry an SD score at this sample count.
+        if "SD_Lead_Samples" not in schema:
+            return False
+        lead = pl.read_parquet(board_path, columns=["DD_Lead_Cost", "SD_Lead_Samples"])
+        return not lead.select(
+            (
+                pl.col("DD_Lead_Cost").is_not_null()
+                & (pl.col("SD_Lead_Samples").is_null() | (pl.col("SD_Lead_Samples") != sd_lead_samples))
+            ).any()
+        ).item()
+    return True
 
 
 def _process_club_session(
@@ -1137,9 +1187,12 @@ def _process_club_session(
     augment_raw_session: Any,
     hrs_cache: Optional[List[Any]] = None,
     cache_file_path: Optional[pathlib.Path] = None,
+    sd_lead: Any = None,
+    suitc: Any = None,
 ) -> Tuple[str, str, Optional[str]]:
     board_path, hand_path = _fragment_paths(output_dir, session.session_id)
-    if _club_fragment_is_current(board_path, hand_path):
+    samples = sd_lead.samples if sd_lead is not None else 0
+    if _club_fragment_is_current(board_path, hand_path, samples, suitc is not None):
         return session.session_id, "resume", None
     raw, _unmapped = load_raw_session(source_dir, session)
     if "Date" not in raw.columns and session.session_date:
@@ -1148,6 +1201,8 @@ def _process_club_session(
         raw,
         hrs_cache=hrs_cache,
         cache_file_path=cache_file_path,
+        sd_lead=sd_lead,
+        suitc=suitc,
     )
     del raw
     write_club_fragments_from_augmented(output_dir, session, augmented, lookup)
@@ -1158,7 +1213,7 @@ CLUB_MANIFEST_FILENAME = "ffbridge_club_manifest.json"
 
 
 def _club_outputs_are_current(
-    output_dir: pathlib.Path, candidate_ids: Sequence[str]
+    output_dir: pathlib.Path, candidate_ids: Sequence[str], sd_lead_samples: int = 0, suitc: bool = False
 ) -> Tuple[bool, str]:
     """Outputs are current when built from these candidates and no fragment changed since.
 
@@ -1175,6 +1230,10 @@ def _club_outputs_are_current(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest["candidates"] != list(candidate_ids):
         return False, "candidate sessions changed"
+    if manifest.get("sd_lead_samples", 0) != sd_lead_samples:
+        return False, f"SD lead samples changed to {sd_lead_samples}"
+    if manifest.get("suitc", False) != suitc:
+        return False, f"SuitC columns turned {'on' if suitc else 'off'}"
     built_at = board_output.stat().st_mtime
     for session_id in manifest["kept"]:
         for path in _fragment_paths(output_dir, session_id):
@@ -1198,8 +1257,14 @@ def _try_write_from_quality_cache(
     limit: Optional[int],
     workers: int = 8,
     if_stale: bool = False,
+    sd_lead_samples: int = 0,
+    suitc: bool = False,
 ) -> Optional[Dict[str, str]]:
     """Augment one session at a time and persist slim Club fragments.
+
+    ``sd_lead_samples`` > 0 adds the single-dummy lead score; solved positions
+    are kept in ``output_dir/ffbridge_sd_lead_cache``. ``suitc`` adds the SC_*
+    SuitC columns (shared SuitC cache, SUITC_CACHE_DIR).
 
     Holding every mlBridge frame until a final concat OOMs on the full
     historical cache. Fragments also let a rerun resume after a crash;
@@ -1219,6 +1284,8 @@ def _try_write_from_quality_cache(
             default_hrs_cache_path,
             load_hrs_cache,
             load_raw_session,
+            make_sd_lead_cache,
+            make_suitc_cache,
         )
     except Exception as exc:
         print(f"[ffbridge-stats-builder] quality pipeline unavailable: {exc}", flush=True)
@@ -1248,7 +1315,7 @@ def _try_write_from_quality_cache(
         raise ValueError("workers must be at least 1")
     candidate_ids = [session.session_id for session in complete]
     if if_stale:
-        current, reason = _club_outputs_are_current(output_dir, candidate_ids)
+        current, reason = _club_outputs_are_current(output_dir, candidate_ids, sd_lead_samples, suitc)
         if current:
             print(f"[ffbridge-stats-builder] {reason}; skipping", flush=True)
             return {
@@ -1258,9 +1325,18 @@ def _try_write_from_quality_cache(
         print(f"[ffbridge-stats-builder] rebuilding: {reason}", flush=True)
     cache_file_path = default_hrs_cache_path(source_dir)
     hrs_cache: List[Any] = [load_hrs_cache(cache_file_path)]
+    sd_lead = (
+        make_sd_lead_cache(sd_lead_samples, output_dir / SD_LEAD_CACHE_DIRNAME)
+        if sd_lead_samples > 0
+        else None
+    )
+    suitc_cache = make_suitc_cache() if suitc else None
+    if suitc_cache is not None:
+        print(f"[ffbridge-stats-builder] SuitC columns on: cache {suitc_cache.directory}", flush=True)
     print(
         f"[ffbridge-stats-builder] checking {len(complete)} cached sessions "
-        f"({workers} worker(s)); SD cache {cache_file_path}",
+        f"({workers} worker(s)); SD cache {cache_file_path}; "
+        f"SD lead {'off' if sd_lead is None else f'{sd_lead_samples} samples, {sd_lead.directory}'}",
         flush=True,
     )
     lookup = load_session_lookup(source_dir)
@@ -1303,6 +1379,8 @@ def _try_write_from_quality_cache(
                     augment_raw_session=augment_raw_session,
                     hrs_cache=hrs_cache,
                     cache_file_path=cache_file_path,
+                    sd_lead=sd_lead,
+                    suitc=suitc_cache,
                 )
             except Exception as exc:
                 session_id, status, error = session.session_id, "skip", str(exc)
@@ -1322,6 +1400,8 @@ def _try_write_from_quality_cache(
                     augment_raw_session=augment_raw_session,
                     hrs_cache=hrs_cache,
                     cache_file_path=cache_file_path,
+                    sd_lead=sd_lead,
+                    suitc=suitc_cache,
                 ): session
                 for session in complete
             }
@@ -1338,6 +1418,8 @@ def _try_write_from_quality_cache(
                 _record(session_id, status, error, done, len(complete))
                 if done % 50 == 0:
                     gc.collect()
+    if sd_lead is not None:
+        sd_lead.flush()
     print(
         f"[ffbridge-stats-builder] {counts['resume']} fragments reused, "
         f"{counts['augment']} sessions augmented, {counts['skip']} skipped",
@@ -1367,7 +1449,7 @@ def _try_write_from_quality_cache(
     )
     written = write_outputs(output_dir, boards, hands, players, clubs)
     (output_dir / CLUB_MANIFEST_FILENAME).write_text(
-        json.dumps({"candidates": candidate_ids, "kept": kept_ids}),
+        json.dumps({"candidates": candidate_ids, "kept": kept_ids, "sd_lead_samples": sd_lead_samples, "suitc": suitc}),
         encoding="utf-8",
     )
     return written
@@ -1468,6 +1550,8 @@ def build(
     from_quality_cache: bool = False,
     workers: int = 8,
     if_stale: bool = False,
+    sd_lead_samples: int = 0,
+    suitc: bool = False,
 ) -> Dict[str, str]:
     if demo:
         boards, hands, players, clubs = demo_frames()
@@ -1477,7 +1561,9 @@ def build(
         if not source_dir:
             raise ValueError("--from-quality-cache requires --source-dir")
         written = _try_write_from_quality_cache(
-            source_dir, output_dir, session_limit, workers=workers, if_stale=if_stale
+            source_dir, output_dir, session_limit, workers=workers, if_stale=if_stale,
+            sd_lead_samples=sd_lead_samples,
+            suitc=suitc,
         )
         if written:
             return written
@@ -1555,6 +1641,20 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--suitc",
+        action="store_true",
+        help="With --from-quality-cache, add the SC_* SuitC single-suit columns (needs SuitC.exe). Changing it re-augments every session.",
+    )
+    parser.add_argument(
+        "--sd-lead-samples",
+        type=int,
+        default=0,
+        help=(
+            "With --from-quality-cache, add the single-dummy lead score with this many "
+            "layouts per lead (0 = off; 20 recommended). Changing it re-augments every session."
+        ),
+    )
+    parser.add_argument(
         "--repair-from-metadata",
         action="store_true",
         help="Fill Date/Club on existing Club parquets from session metadata.",
@@ -1602,6 +1702,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             from_quality_cache=args.from_quality_cache,
             workers=args.workers,
             if_stale=args.if_stale,
+            sd_lead_samples=args.sd_lead_samples,
+            suitc=args.suitc,
         )
         print(json.dumps({"output_dir": str(output_dir), "files": written}, indent=2))
         return 0
